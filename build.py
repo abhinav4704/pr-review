@@ -70,11 +70,20 @@ def main():
     for path in walk(be_dir, (".py",)):
         rel = os.path.relpath(path, repo)
         try:
-            src = open(path, encoding="utf-8").read()
-            source_map[rel.replace("\\", "/")] = src
-            per_file.append(python_backend.extract_python(rel, src, backend_root))
+            src = open(path, encoding="utf-8", errors="replace").read()
+        except OSError as e:
+            print(f"  skip (read) {rel}: {e}", file=sys.stderr)
+            continue
+        try:
+            payload = python_backend.extract_python(rel, src, backend_root)
         except SyntaxError as e:
             print(f"  skip (syntax) {rel}: {e}", file=sys.stderr)
+            continue
+        except Exception as e:  # never let one bad file abort the whole build
+            print(f"  skip (extract) {rel}: {e}", file=sys.stderr)
+            continue
+        source_map[rel.replace("\\", "/")] = src
+        per_file.append(payload)
 
     fe_files = []
     if args.frontend or fe_dir == repo:
@@ -83,9 +92,14 @@ def main():
             rel = os.path.relpath(path, repo)
             if rel in scanned:
                 continue
-            src = open(path, encoding="utf-8").read()
+            try:
+                src = open(path, encoding="utf-8", errors="replace").read()
+                fe = frontend.extract_frontend(rel, src, ts_cwd=fe_dir)
+            except Exception as e:  # e.g. node/typescript missing — skip, don't abort
+                print(f"  skip (frontend) {rel}: {e}", file=sys.stderr)
+                continue
             source_map[rel.replace("\\", "/")] = src
-            fe_files.append(frontend.extract_frontend(rel, src, ts_cwd=fe_dir))
+            fe_files.append(fe)
 
     nodes, edges = resolve.build(per_file, fe_files)
 

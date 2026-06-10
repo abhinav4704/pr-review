@@ -84,7 +84,7 @@ def _hop_mode(args) -> None:
     output: list[dict] = []
     for sid in seeds:
         depth = hop_map[sid]
-        sg_nodes, sg_edges = retrieve.subgraph([sid], nodes, edges, max_hops=depth)
+        sg_nodes, _ = retrieve.subgraph([sid], nodes, edges, max_hops=depth)
         for n in sg_nodes:
             if n["id"] in seen:
                 continue
@@ -102,14 +102,6 @@ def _hop_mode(args) -> None:
             if sliced:
                 record["source"] = sliced
             output.append(record)
-
-        # Also report edges visible in this subgraph.
-        for e in sg_edges:
-            record = {
-                "edge": e.get("type"),
-                "src":  e.get("src"),
-                "dst":  e.get("dst"),
-            }
 
     # Optionally filter output by kind.
     if args.kind:
