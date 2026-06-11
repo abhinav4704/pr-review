@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 CHARS_PER_TOKEN = 4
 LINE_GAP = 8          # added lines within this many lines of each other → same chunk
 CHUNK_TOKEN_BUDGET = 6000   # max tokens per chunk dossier
+FILE_CHUNK_TOKEN_BUDGET = 12000   # whole-file review: max tokens of file content per chunk
 
 
 def _toks(text: str) -> int:
@@ -50,13 +51,19 @@ def _toks(text: str) -> int:
 
 @dataclass
 class Chunk:
-    """A group of nearby added lines in a single file."""
+    """A slice of a single file under review.
+
+    For whole-file review (make_file_chunks) the slice spans start_line..end_line
+    of the file; added_lines marks which of those lines the PR changed.
+    """
     file_path: str
     added_lines: List[int]          # sorted list of + line numbers in this chunk
     node_ids: List[str]             # graph nodes whose spans cover these lines
-    dossier: str = ""               # filled by build_chunk_dossier()
+    dossier: str = ""               # filled by build_*_dossier()
     chunk_index: int = 0            # position within the file's chunks (0-based)
     total_chunks: int = 1
+    start_line: int = 0             # first line of the chunk's file span (whole-file mode)
+    end_line: int = 0              # last line of the chunk's file span (whole-file mode)
 
 
 # ── Proximity chunking ────────────────────────────────────────────────────────
@@ -106,8 +113,14 @@ def build_chunk_dossier(
     file_changes: List[ChangedNode],
     embed_index: Optional["EmbeddingIndex"] = None,
     token_budget: int = CHUNK_TOKEN_BUDGET,
+    cross_file: bool = True,
 ) -> str:
-    """Build a self-contained dossier for a single proximity chunk."""
+    """Build a self-contained dossier for a single proximity chunk.
+
+    When ``cross_file`` is False (Quick tier), only the changed file's own code
+    is included — callers/callees/tests/similar patterns from other files are
+    omitted, keeping the review file-local and cheap.
+    """
     used = 0
     parts: List[str] = []
     emitted: Set[str] = set()
@@ -158,6 +171,10 @@ def build_chunk_dossier(
         block = _slice_node(cg, nid, f"CHANGED [{ctype}]")
         if add(f"```\n{block}\n```\n"):
             emitted.add(nid)
+
+    # ── file-local mode: stop here, no cross-file context ─────────────────────
+    if not cross_file:
+        return "\n".join(parts)
 
     # ── collect tiered context for nodes in this chunk ────────────────────────
     callers_d1: List[str] = []
@@ -248,6 +265,7 @@ def build_all_chunk_dossiers(
     file_changes: List[ChangedNode],
     embed_index: Optional["EmbeddingIndex"] = None,
     token_budget: int = CHUNK_TOKEN_BUDGET,
+    cross_file: bool = True,
 ) -> List[Chunk]:
     """Fill chunk.dossier for every chunk in the list. Returns the same list."""
     for chunk in chunks:
@@ -255,7 +273,161 @@ def build_all_chunk_dossiers(
             chunk, cg, blast, file_changes,
             embed_index=embed_index,
             token_budget=token_budget,
+            cross_file=cross_file,
         )
+    return chunks
+
+
+# ── Whole-file, definition-aware chunking ─────────────────────────────────────
+# The reviewer sends the ENTIRE changed file so the model can judge whether the
+# file works as a whole. If the file fits the budget it is one chunk; otherwise
+# it is split on function/class boundaries (never mid-function).
+
+def _file_line_count(cg: CodeGraph, file_path: str) -> int:
+    full = cg.source_lines(file_path, 1, 10 ** 9)
+    if not full:
+        return 0
+    return full.count("\n") + (0 if full.endswith("\n") else 1)
+
+
+def _outermost_defs(cg: CodeGraph, file_path: str) -> List[tuple]:
+    """Top-level definitions in the file (methods nested in a class are dropped).
+
+    Returns a list of (start_line, end_line, node_id) sorted by start_line.
+    """
+    raw = []
+    for nid in cg.defs_in_file(file_path):
+        d = cg.node(nid)
+        s, e = d.get("start_line"), d.get("end_line")
+        if s and e and e >= s:
+            raw.append((s, e, nid))
+    # container first (smaller start; on tie, larger span) so nested defs are dropped
+    raw.sort(key=lambda t: (t[0], -(t[1] - t[0])))
+    kept: List[tuple] = []
+    for s, e, nid in raw:
+        if any(ks <= s and e <= ke for ks, ke, _ in kept):
+            continue          # contained within a def we already kept
+        kept.append((s, e, nid))
+    kept.sort(key=lambda t: t[0])
+    return kept
+
+
+def _split_range(cg: CodeGraph, file_path: str, a: int, b: int,
+                 token_budget: int) -> List[tuple]:
+    """Split an oversized line range [a, b] into windows each <= token_budget."""
+    text = cg.source_lines(file_path, a, b)
+    lines = text.splitlines()
+    budget_chars = token_budget * CHARS_PER_TOKEN
+    out: List[tuple] = []
+    cur_start = a
+    cur_chars = 0
+    for i, ln in enumerate(lines):
+        ln_no = a + i
+        ln_chars = len(ln) + 1
+        if cur_chars + ln_chars > budget_chars and ln_no > cur_start:
+            out.append((cur_start, ln_no - 1))
+            cur_start, cur_chars = ln_no, 0
+        cur_chars += ln_chars
+    out.append((cur_start, a + max(len(lines), 1) - 1))
+    return out
+
+
+def make_file_chunks(
+    cg: CodeGraph,
+    file_path: str,
+    file_diff: FileDiff,
+    token_budget: int = FILE_CHUNK_TOKEN_BUDGET,
+) -> List[Chunk]:
+    """Cover the whole file with chunks, split on definition boundaries.
+
+    One chunk if the file fits the budget; otherwise whole definitions are packed
+    up to the budget, and a single oversized definition is windowed.
+    """
+    total_lines = _file_line_count(cg, file_path)
+    if total_lines == 0:
+        return []
+
+    # 1. ordered segments covering every line: defs + module-code gaps
+    defs = _outermost_defs(cg, file_path)
+    segments: List[tuple] = []
+    cursor = 1
+    for s, e, nid in defs:
+        s, e = max(s, 1), min(e, total_lines)
+        seg_start = max(s, cursor)
+        if seg_start > cursor:
+            segments.append((cursor, seg_start - 1, None))   # module code before def
+        if e >= seg_start:
+            segments.append((seg_start, e, nid))
+            cursor = e + 1
+    if cursor <= total_lines:
+        segments.append((cursor, total_lines, None))
+
+    # 2. pack segments into chunks under the budget
+    added = file_diff.added_lines
+    chunks: List[Chunk] = []
+
+    def add_chunk(start: int, end: int, nodes: List[str]) -> None:
+        chunks.append(Chunk(
+            file_path=file_path,
+            added_lines=sorted(l for l in added if start <= l <= end),
+            node_ids=[n for n in nodes if n],
+            start_line=start,
+            end_line=end,
+        ))
+
+    cur = None  # {"start","end","nodes","toks"}
+    for a, b, nid in segments:
+        seg_toks = _toks(cg.source_lines(file_path, a, b))
+        if seg_toks > token_budget:
+            if cur:
+                add_chunk(cur["start"], cur["end"], cur["nodes"])
+                cur = None
+            for wa, wb in _split_range(cg, file_path, a, b, token_budget):
+                add_chunk(wa, wb, [nid])
+            continue
+        if cur is None:
+            cur = {"start": a, "end": b, "nodes": [nid], "toks": seg_toks}
+        elif cur["toks"] + seg_toks <= token_budget:
+            cur["end"] = b
+            cur["toks"] += seg_toks
+            cur["nodes"].append(nid)
+        else:
+            add_chunk(cur["start"], cur["end"], cur["nodes"])
+            cur = {"start": a, "end": b, "nodes": [nid], "toks": seg_toks}
+    if cur:
+        add_chunk(cur["start"], cur["end"], cur["nodes"])
+
+    for i, ch in enumerate(chunks):
+        ch.chunk_index = i
+        ch.total_chunks = len(chunks)
+    return chunks
+
+
+def build_file_chunk_dossier(chunk: Chunk, cg: CodeGraph, file_path: str) -> str:
+    """Render a whole-file chunk: full source with line numbers and + markers."""
+    a, b = chunk.start_line, chunk.end_line
+    raw = cg.source_lines(file_path, a, b)
+    added = set(chunk.added_lines)
+    changed_str = ", ".join(str(l) for l in chunk.added_lines) or "none in this chunk"
+    annotated = []
+    for i, ln_text in enumerate(raw.splitlines()):
+        lineno = a + i
+        marker = "+" if lineno in added else " "
+        annotated.append(f"{marker} {lineno:4d}  {ln_text}")
+    header = (
+        f"## FILE: {file_path} — chunk {chunk.chunk_index + 1}/{chunk.total_chunks} "
+        f"— lines {a}-{b}\n"
+        f"_Full file content below; lines added/changed in this PR are marked '+'. "
+        f"Changed lines here: {changed_str}._\n"
+    )
+    return header + "```\n" + "\n".join(annotated) + "\n```\n"
+
+
+def build_all_file_chunk_dossiers(
+    chunks: List[Chunk], cg: CodeGraph, file_path: str,
+) -> List[Chunk]:
+    for ch in chunks:
+        ch.dossier = build_file_chunk_dossier(ch, cg, file_path)
     return chunks
 
 

@@ -93,6 +93,7 @@ TOOLS = [
 FINDINGS_SCHEMA = """
 Return ONLY a JSON array (no prose, no fences) where each element has:
 {
+  "kind": "issue"|"suggestion", // "issue" = something wrong; "suggestion" = optional improvement
   "category": string,       // agent's specialty category
   "severity": "critical"|"high"|"medium"|"low"|"info",
   "file": string,           // file path
@@ -102,7 +103,9 @@ Return ONLY a JSON array (no prose, no fences) where each element has:
   "evidence": string,       // short snippet that demonstrates the issue
   "recommendation": string  // concrete actionable fix
 }
-If you find no issues, return [].
+Report concrete problems as "issue". Report optional improvements (style,
+refactors, nice-to-haves) as "suggestion" with severity "info" or "low".
+If you find nothing, return [].
 """
 
 
@@ -184,19 +187,26 @@ class Finding:
     explanation: str
     evidence: str
     recommendation: str
+    kind: str = "issue"          # "issue" | "suggestion"
 
     @classmethod
     def from_dict(cls, d: dict) -> Optional["Finding"]:
         try:
+            severity = str(d.get("severity", "low")).lower()
+            kind = str(d.get("kind", "")).lower()
+            if kind not in ("issue", "suggestion"):
+                # fall back: treat informational findings as suggestions
+                kind = "suggestion" if severity == "info" else "issue"
             return cls(
                 category=str(d.get("category", "code-quality")),
-                severity=str(d.get("severity", "low")).lower(),
+                severity=severity,
                 file=str(d.get("file", "")),
                 line=int(d.get("line", 0) or 0),
                 title=str(d.get("title", "")).strip(),
                 explanation=str(d.get("explanation", "")).strip(),
                 evidence=str(d.get("evidence", "")).strip(),
                 recommendation=str(d.get("recommendation", "")).strip(),
+                kind=kind,
             )
         except (TypeError, ValueError):
             return None
@@ -271,13 +281,17 @@ class BaseAgent:
 
     def _user_prompt(self, dossier: str) -> str:
         return (
-            f"You are the {self.name} specialist reviewing the following PR dossier.\n\n"
-            f"Focus ONLY on {self.category} issues.\n"
+            f"You are the {self.name} specialist. Below is the FULL content of a file "
+            f"under review (or one chunk of a large file). Lines added or changed in "
+            f"this PR are marked with a leading '+'.\n\n"
+            f"Focus ONLY on {self.category} issues. Verify the code works as a whole: "
+            f"PRIORITIZE the changed (+) lines and anything they affect, but you may also "
+            f"report a serious bug elsewhere in the file. Pin every finding to a line number.\n"
             f"Use the provided tools if you need to look up callers, source, or "
             f"similar patterns before making a judgment.\n\n"
             f"When you have finished your analysis, output your findings as JSON:\n"
             f"{FINDINGS_SCHEMA}\n\n"
-            f"=== DOSSIER ===\n{dossier}"
+            f"=== FILE UNDER REVIEW ===\n{dossier}"
         )
 
 
@@ -358,7 +372,9 @@ class ArchitectureAgent(BaseAgent):
         "a controller), tight coupling where dependency injection should be used, "
         "magic numbers/strings that should be constants, duplicated logic that already "
         "exists in the repo (use find_similar to check), overly long functions (>50 lines "
-        "of added code), and deviation from established patterns in the codebase."
+        "of added code), and deviation from established patterns in the codebase. "
+        "Emit structural improvements that are optional as kind=\"suggestion\"; emit "
+        "genuine defects (e.g. circular imports that will fail) as kind=\"issue\"."
     )
 
 
@@ -370,3 +386,45 @@ ALL_AGENTS: List[BaseAgent] = [
     TestCoverageAgent(),
     ArchitectureAgent(),
 ]
+
+# Registry keyed by agent.name, used by profiles.build_agents().
+AGENT_REGISTRY: Dict[str, type] = {
+    "security": SecurityAgent,
+    "correctness": CorrectnessAgent,
+    "performance": PerformanceAgent,
+    "api_contract": ApiContractAgent,
+    "test_coverage": TestCoverageAgent,
+    "architecture": ArchitectureAgent,
+}
+
+
+# ── Breaking-change (caller compatibility) pass ────────────────────────────────
+# Used by review.run_dependency_check — not an agentic tool-loop agent. Given a
+# changed function's identity card (old -> new) and its UNMODIFIED call sites in
+# other files, decide for each whether the change breaks it.
+DEPENDENCY_SYSTEM = (
+    "You are a senior engineer checking whether a change to one function breaks "
+    "the code in OTHER files that calls it. You are given the changed function's "
+    "identity (old vs new signature/behavior) and the exact call sites that were "
+    "NOT modified in this PR. For each call site, decide if it is now broken — "
+    "wrong number/names/types of arguments, a removed/renamed parameter, a changed "
+    "return type/shape the caller still uses the old way, or a behavioral contract "
+    "the caller relies on. Report ONLY call sites that will actually break. Do not "
+    "speculate about call sites that still look compatible."
+)
+
+DEPENDENCY_INSTRUCTIONS = """A function changed in this PR. Decide which UNMODIFIED callers it breaks.
+
+{schema}
+
+Use category "breaking-change" and kind "issue". Severity "critical" if it will
+raise/crash or corrupt data, otherwise "high". Set "file" and "line" to the exact
+caller call site. In "explanation" state plainly: "changing X breaks this call
+because ...; this caller was not updated in the PR."
+
+=== CHANGED FUNCTION ===
+{card}
+
+=== UNMODIFIED CALL SITES (in other files) ===
+{callers}
+"""

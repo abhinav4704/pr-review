@@ -1,17 +1,18 @@
-"""Per-file, per-chunk specialist agent orchestration.
+"""Per-file specialist agent orchestration (whole-file review).
 
 Pipeline per changed file:
-    1. Split added lines into proximity chunks  (context.make_chunks)
-    2. Build an isolated dossier per chunk      (context.build_chunk_dossier)
+    1. Split the WHOLE file into definition-aware chunks  (context.make_file_chunks)
+       — one chunk if the file fits the budget, else split on function boundaries
+    2. Render each chunk (full source, changed lines marked '+')
     3. For each chunk, run every active agent   (agents.BaseAgent.run)
        — each agent has an agentic tool loop to query the graph mid-reasoning
     4. Merge findings from all chunks/agents
     5. Deduplicate by (file, line, title)
     6. Run evidence verifier over the combined dossier
-    7. Compute per-file and overall risk scores
+    7. Cross-file breaking-change pass over the changed (+) functions only
 
-This means findings are always grounded in a specific chunk's added lines,
-and each chunk gets only its relevant context — not the whole file mixed together.
+The model sees the entire file so it can judge whether the file works as a whole,
+while findings stay pinned to line numbers and prioritize the changed lines.
 """
 
 from __future__ import annotations
@@ -20,17 +21,34 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from .agents import ALL_AGENTS, Finding
+from .agents import (
+    ALL_AGENTS,
+    DEPENDENCY_INSTRUCTIONS,
+    DEPENDENCY_SYSTEM,
+    FINDINGS_SCHEMA,
+    Finding,
+    _parse_findings,
+)
 from .blast import BlastResult
 from .context import (
     Chunk,
-    build_all_chunk_dossiers,
+    _slice_node,
+    build_all_file_chunk_dossiers,
     build_dossier,
-    make_chunks,
+    make_file_chunks,
 )
-from .diff import ChangedNode, FileDiff, group_by_file
+from .diff import (
+    ChangedNode,
+    FileDiff,
+    group_by_file,
+    node_was_modified,
+    old_signature_for,
+)
+from .filters import should_review
 from .graph import CodeGraph
+from .identity import IdentityCard, build_identity_card, render_card
 from .llm import NovaClient, _extract_json
+from .profiles import DEEP, ReviewProfile, build_agents
 
 if TYPE_CHECKING:
     from .embeddings import EmbeddingIndex
@@ -92,14 +110,49 @@ class FileReviewResult:
 
 
 @dataclass
+class CallerRef:
+    """A function in another file that calls a changed function."""
+    node_id: str
+    qualname: str
+    file: str
+    line: int
+    source: str           # the caller function's source (snippet, truncated)
+    broken: bool = False  # flagged as broken by the breaking-change pass
+
+
+@dataclass
+class DependencyView:
+    """For one changed function, the external callers that depend on it."""
+    changed_node_id: str
+    changed_qualname: str
+    changed_file: str
+    change_type: str
+    callers: List[CallerRef] = field(default_factory=list)
+
+
+@dataclass
 class OverallResult:
     file_results: Dict[str, FileReviewResult] = field(default_factory=dict)
     all_findings: List[Finding] = field(default_factory=list)
+    breaking: List[Finding] = field(default_factory=list)   # caller-compat issues
+    dependencies: List[DependencyView] = field(default_factory=list)  # callers per changed fn
     risk_score: int = 0
     risk_level: str = "low"
     metrics: Dict[str, float] = field(default_factory=dict)
     dossier_tokens: int = 0
     dropped_total: int = 0
+    profile_key: str = "deep"
+    skipped_files: List[str] = field(default_factory=list)  # ignored (lock/binary/config)
+
+    @property
+    def issues(self) -> List[Finding]:
+        """Concrete problems (excludes suggestions)."""
+        return [f for f in self.all_findings if f.kind == "issue"]
+
+    @property
+    def suggestions(self) -> List[Finding]:
+        """Optional improvements."""
+        return [f for f in self.all_findings if f.kind == "suggestion"]
 
 
 # ── Verifier ──────────────────────────────────────────────────────────────────
@@ -158,26 +211,22 @@ def run_file_review(
     blast: BlastResult,
     nova: NovaClient,
     embed_index: Optional["EmbeddingIndex"] = None,
-    token_budget: int = 6000,
+    token_budget: int = 12000,
     verify: bool = True,
     agents: list = None,
 ) -> FileReviewResult:
     result = FileReviewResult(file_path=file_path)
     active_agents = agents if agents is not None else ALL_AGENTS
 
-    # 1. build proximity chunks
-    chunks = make_chunks(cg, file_path, file_diff, file_changes)
+    # 1. split the WHOLE file into definition-aware chunks (one if it fits)
+    chunks = make_file_chunks(cg, file_path, file_diff, token_budget=token_budget)
     result.num_chunks = len(chunks)
 
     if not chunks:
         return result
 
-    # 2. build per-chunk dossiers
-    build_all_chunk_dossiers(
-        chunks, cg, blast, file_changes,
-        embed_index=embed_index,
-        token_budget=token_budget,
-    )
+    # 2. render each chunk's dossier (full source, changed lines marked '+')
+    build_all_file_chunk_dossiers(chunks, cg, file_path)
     result.dossier_tokens = sum(_toks(c.dossier) for c in chunks)
 
     # 3. review each chunk independently
@@ -252,6 +301,115 @@ def _toks(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+# ── Breaking-change (caller compatibility) pass ───────────────────────────────
+
+def _caller_line(cg: CodeGraph, caller_id: str) -> int:
+    return int(cg.node(caller_id).get("start_line", 0)) if cg.has(caller_id) else 0
+
+
+def run_dependency_check(
+    cg: CodeGraph,
+    changes: List[ChangedNode],
+    blast: BlastResult,
+    file_diffs: List[FileDiff],
+    diff_text: str,
+    nova: NovaClient,
+    card_cache: Optional[Dict[str, IdentityCard]] = None,
+) -> Tuple[List[Finding], List["DependencyView"]]:
+    """Flag callers in OTHER files that a changed signature breaks and that the
+    PR did not update.
+
+    For each changed function/route whose signature changed (or that was added),
+    gather its direct callers that live in a different file and were NOT modified
+    in this PR, then ask the model which of those call sites are now broken.
+
+    Returns (findings, dependency_views). The views list every examined external
+    caller (name + source) so the UI can show "what uses this changed function",
+    independent of whether a problem was found.
+    """
+    if card_cache is None:
+        card_cache = {}
+    out: List[Finding] = []
+    views: List[DependencyView] = []
+
+    for ch in changes:
+        if ch.change_type not in ("signature", "added"):
+            continue
+        if not cg.has(ch.node_id):
+            continue
+        imp = blast.per_change.get(ch.node_id)
+        if not imp:
+            continue
+        changed_node = cg.node(ch.node_id)
+        changed_path = changed_node.get("path")
+
+        ext_callers: List[str] = []
+        for caller, dist in imp.callers.items():
+            if dist != 1 or not cg.has(caller):
+                continue
+            if cg.node(caller).get("path") == changed_path:
+                continue                      # same file → normal review covers it
+            if node_was_modified(file_diffs, cg, caller):
+                continue                      # caller already updated in this PR
+            ext_callers.append(caller)
+
+        if not ext_callers:
+            continue
+
+        # record the dependency view (callers + their source) for the UI
+        view = DependencyView(
+            changed_node_id=ch.node_id,
+            changed_qualname=changed_node.get("qualname") or changed_node.get("name", ""),
+            changed_file=changed_path or ch.file_path,
+            change_type=ch.change_type,
+            callers=[
+                CallerRef(
+                    node_id=c,
+                    qualname=cg.node(c).get("qualname") or cg.node(c).get("name", ""),
+                    file=cg.node(c).get("path", ""),
+                    line=_caller_line(cg, c),
+                    source=cg.source(c)[:2000],
+                )
+                for c in ext_callers
+            ],
+        )
+        views.append(view)
+
+        card = build_identity_card(cg, ch.node_id, ch.change_type,
+                                   nova=nova, cache=card_cache)
+        if card is None:
+            continue
+        old_sig = old_signature_for(diff_text, cg, ch.node_id)
+        callers_block = "\n\n".join(
+            _slice_node(cg, c, f"CALLER ({cg.node(c).get('path')}:{_caller_line(cg, c)})")
+            for c in ext_callers
+        )
+        prompt = DEPENDENCY_INSTRUCTIONS.format(
+            schema=FINDINGS_SCHEMA,
+            card=render_card(card, old_sig),
+            callers=callers_block,
+        )
+        try:
+            raw = nova.complete(DEPENDENCY_SYSTEM, prompt)
+        except Exception:
+            continue
+        broken_files = set()
+        for f in _parse_findings(raw):
+            f.category = "breaking-change"
+            f.kind = "issue"
+            if f.severity not in ("critical", "high"):
+                f.severity = "high"
+            out.append(f)
+            broken_files.add((f.file, f.line))
+        # mark which callers were flagged broken (best-effort by file:line)
+        for cref in view.callers:
+            if any(cref.file == bf and abs(cref.line - bl) <= 50
+                   for bf, bl in broken_files):
+                cref.broken = True
+
+    return out, views
+
+
 # ── Overall review ────────────────────────────────────────────────────────────
 
 def run_review(
@@ -262,22 +420,43 @@ def run_review(
     file_diffs: List[FileDiff],
     nova: NovaClient,
     embed_index: Optional["EmbeddingIndex"] = None,
-    token_budget: int = 6000,
-    verify: bool = True,
+    token_budget: int = 12000,
+    profile: Optional[ReviewProfile] = None,
     agents: list = None,
+    verify: Optional[bool] = None,
+    progress_cb=None,
+    review_config: bool = False,
 ) -> OverallResult:
-    overall = OverallResult(metrics=blast.metrics)
-    by_file = group_by_file(changes)
-    file_diff_map = {fd.path: fd for fd in file_diffs}
+    # Resolve the profile (default to DEEP = run everything, the legacy behavior).
+    profile = profile or DEEP
+    if agents is None:
+        agents = build_agents(profile.agent_keys)
+    if verify is None:
+        verify = profile.verify
 
-    for fpath, file_changes in by_file.items():
-        fd = file_diff_map.get(fpath)
-        if not fd:
+    overall = OverallResult(metrics=blast.metrics, profile_key=profile.key)
+    by_file = group_by_file(changes)
+
+    # files we will actually review (changed, non-deleted, not generated/binary/config)
+    review_files = []
+    for fd in file_diffs:
+        if fd.is_deleted or not fd.added_lines:
             continue
+        if not should_review(fd.path, include_config=review_config):
+            overall.skipped_files.append(fd.path)
+            continue
+        review_files.append(fd)
+    n_files = len(review_files)
+
+    # Review every changed source file IN FULL (not only files with mapped nodes),
+    # so module-level edits still get a whole-file review.
+    for i, fd in enumerate(review_files):
+        if progress_cb:
+            progress_cb("file", i, n_files, fd.path)
         file_result = run_file_review(
-            file_path=fpath,
+            file_path=fd.path,
             file_diff=fd,
-            file_changes=file_changes,
+            file_changes=by_file.get(fd.path, []),
             cg=cg,
             blast=blast,
             nova=nova,
@@ -286,10 +465,24 @@ def run_review(
             verify=verify,
             agents=agents,
         )
-        overall.file_results[fpath] = file_result
+        if file_result.num_chunks == 0:
+            continue          # unreadable / non-source file with no content
+        overall.file_results[fd.path] = file_result
         overall.all_findings.extend(file_result.findings)
         overall.dossier_tokens += file_result.dossier_tokens
         overall.dropped_total += file_result.dropped
+
+    # Cross-file breaking-change pass (Standard / Deep).
+    if profile.caller_compat:
+        if progress_cb:
+            progress_cb("dependency", n_files, n_files, "")
+        card_cache: Dict[str, IdentityCard] = {}
+        breaking, deps = run_dependency_check(
+            cg, changes, blast, file_diffs, diff_text, nova, card_cache=card_cache,
+        )
+        overall.breaking = breaking
+        overall.dependencies = deps
+        overall.all_findings.extend(breaking)
 
     order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
     overall.all_findings.sort(key=lambda f: order.get(f.severity, 9))
@@ -299,45 +492,79 @@ def run_review(
 
 # ── Report formatter ──────────────────────────────────────────────────────────
 
+def _fmt_finding(f: Finding, i: int) -> List[str]:
+    out = [f"\n### {i}. [{f.severity.upper()}] {f.title}",
+           f"`{f.category}` · `{f.file}:{f.line}`",
+           f"\n{f.explanation}"]
+    if f.evidence:
+        out.append(f"\n**Evidence:** `{f.evidence}`")
+    if f.recommendation:
+        out.append(f"\n**Fix:** {f.recommendation}")
+    return out
+
+
 def format_report(result: OverallResult) -> str:
     lines = ["# PR Review Report", ""]
+    lines.append(f"_Review depth: **{result.profile_key.upper()}**_")
+
+    # severity summary (counts, not a risk score)
+    sev = {s: 0 for s in ("critical", "high", "medium", "low", "info")}
+    file_issues = [f for fr in result.file_results.values() for f in fr.findings
+                   if f.kind == "issue"]
+    for f in file_issues:
+        sev[f.severity] = sev.get(f.severity, 0) + 1
     lines.append(
-        f"**Overall risk: {result.risk_level.upper()} ({result.risk_score}/100)**"
+        f"**Critical: {sev['critical']} · High: {sev['high']} · "
+        f"Medium: {sev['medium']} · Low: {sev['low']} · "
+        f"Breaking: {len(result.breaking)} · Suggestions: {len(result.suggestions)}**"
     )
-    m = result.metrics
     lines.append(
-        f"_Changed nodes: {int(m.get('changed_nodes', 0))} · "
-        f"impacted callers: {int(m.get('impacted_callers', 0))} · "
-        f"sensitive: {int(m.get('sensitive_changes', 0))} · "
-        f"no-test changes: {int(m.get('changes_without_tests', 0))} · "
+        f"_Changed nodes: {int(result.metrics.get('changed_nodes', 0))} · "
         f"verifier dropped total: {result.dropped_total} · "
         f"~{result.dossier_tokens} tokens_"
     )
     lines.append("")
 
+    # ── Breaking changes (cross-file) first ───────────────────────────────────
+    if result.breaking:
+        lines.append("---\n## ⚠️ Breaking changes (callers not updated)\n")
+        for i, f in enumerate(result.breaking, 1):
+            lines.extend(_fmt_finding(f, i))
+        lines.append("")
+
     if not result.file_results:
         lines.append("No source files with mapped changes.")
         return "\n".join(lines)
 
+    # ── Issues grouped per file ───────────────────────────────────────────────
+    lines.append("---\n## Issues by file\n")
     for fpath, fr in sorted(result.file_results.items()):
+        issues = [f for f in fr.findings if f.kind == "issue"]
         lines.append(
-            f"---\n## `{fpath}`  "
+            f"### `{fpath}`  "
             f"— risk: {fr.risk_level.upper()} ({fr.risk_score}/100)  "
             f"— {fr.num_chunks} chunk(s)"
         )
         if fr.dropped:
             lines.append(f"_Verifier dropped {fr.dropped} finding(s)._")
-        if not fr.findings:
+        if not issues:
             lines.append("No issues found.\n")
             continue
-        for i, f in enumerate(fr.findings, 1):
-            lines.append(f"\n### {i}. [{f.severity.upper()}] {f.title}")
+        for i, f in enumerate(issues, 1):
+            lines.extend(_fmt_finding(f, i))
+        lines.append("")
+
+    # ── Suggestions (improvements) last ───────────────────────────────────────
+    suggestions = result.suggestions
+    lines.append("---\n## Suggestions\n")
+    if not suggestions:
+        lines.append("_No suggestions._")
+    else:
+        for i, f in enumerate(suggestions, 1):
+            lines.append(f"\n### {i}. {f.title}")
             lines.append(f"`{f.category}` · `{f.file}:{f.line}`")
             lines.append(f"\n{f.explanation}")
-            if f.evidence:
-                lines.append(f"\n**Evidence:** `{f.evidence}`")
             if f.recommendation:
-                lines.append(f"\n**Fix:** {f.recommendation}")
-        lines.append("")
+                lines.append(f"\n**Suggested change:** {f.recommendation}")
 
     return "\n".join(lines)

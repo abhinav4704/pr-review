@@ -123,3 +123,63 @@ def group_by_file(changes: List[ChangedNode]) -> Dict[str, List[ChangedNode]]:
     for ch in changes:
         out.setdefault(ch.file_path, []).append(ch)
     return out
+
+
+# ── helpers for the breaking-change (caller compatibility) pass ────────────────
+
+def node_was_modified(file_diffs: List[FileDiff], cg: CodeGraph, node_id: str) -> bool:
+    """True if any of the node's source lines were added/changed in this PR.
+
+    Used to prove a *caller* was NOT updated to match a changed signature: if a
+    caller's span contains none of its file's added lines, the PR left it alone.
+    """
+    if not cg.has(node_id):
+        return False
+    d = cg.node(node_id)
+    path, start, end = d.get("path"), d.get("start_line", 0), d.get("end_line", 0)
+    for fd in file_diffs:
+        if fd.path == path:
+            return any(start <= ln <= end for ln in fd.added_lines)
+    return False
+
+
+_DECL_KEYWORDS = ("def ", "function ", "class ", "func ", "fn ")
+
+
+def _removed_lines_by_file(diff_text: str) -> Dict[str, List[str]]:
+    """Map each file path to its list of removed (-) line texts."""
+    out: Dict[str, List[str]] = {}
+    cur: Optional[str] = None
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git"):
+            cur = None
+        elif line.startswith("--- "):
+            continue
+        elif line.startswith("+++ "):
+            target = line[4:].strip()
+            if target != "/dev/null":
+                cur = target[2:] if target.startswith("b/") else target
+                out.setdefault(cur, [])
+        elif line.startswith("-") and not line.startswith("---") and cur is not None:
+            out[cur].append(line[1:])
+    return out
+
+
+def old_signature_for(diff_text: str, cg: CodeGraph, node_id: str) -> Optional[str]:
+    """Best-effort recovery of a changed function's OLD declaration line.
+
+    Looks through the removed (-) lines of the node's file for a declaration of
+    the node's simple name. Returns the stripped line, or None.
+    """
+    if not cg.has(node_id):
+        return None
+    d = cg.node(node_id)
+    name = d.get("name", "")
+    if not name:
+        return None
+    for removed in _removed_lines_by_file(diff_text).get(d.get("path", ""), []):
+        stripped = removed.strip()
+        if (name in stripped
+                and (any(k in stripped for k in _DECL_KEYWORDS) or f"{name}(" in stripped)):
+            return stripped
+    return None

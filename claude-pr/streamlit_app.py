@@ -72,6 +72,17 @@ with st.sidebar:
     st.divider()
     st.header("⚙️ Review options")
 
+    from pr_review.profiles import PROFILES, QUICK, STANDARD, DEEP
+
+    depth_choices = {QUICK.label: QUICK, STANDARD.label: STANDARD, DEEP.label: DEEP}
+    depth_label = st.radio(
+        "Review depth",
+        list(depth_choices.keys()),
+        index=1,  # default: Standard
+    )
+    profile = depth_choices[depth_label]
+    st.caption(profile.description)
+
     dossier_only = st.toggle(
         "Dossier only (no LLM)",
         value=False,
@@ -81,27 +92,50 @@ with st.sidebar:
     with st.expander("Model settings"):
         model_id = st.text_input("Nova model id", value="us.amazon.nova-pro-v1:0")
         region = st.text_input("AWS region", value="us-east-1")
-        token_budget = st.slider("Token budget per file", 2000, 30000, 8000, step=500)
+        token_budget = st.slider(
+            "Max tokens per chunk", 4000, 24000, 12000, step=500,
+            help="Whole-file review: a file under this size is sent in one chunk; "
+                 "larger files split on function boundaries. Keep it well under the "
+                 "model's context window so a small model stays grounded.",
+        )
         max_output = st.slider("Max output tokens", 1024, 5000, 4096, step=256)
 
-    with st.expander("Agent selection"):
-        st.caption("Deselect agents you don't need to save cost/time.")
-        run_security = st.checkbox("Security", value=True)
-        run_correctness = st.checkbox("Correctness / regression", value=True)
-        run_performance = st.checkbox("Performance", value=True)
-        run_api = st.checkbox("API & DB contracts", value=True)
-        run_tests = st.checkbox("Test coverage", value=True)
-        run_arch = st.checkbox("Architecture", value=True)
-
-    with st.expander("Quality controls"):
-        verify = st.toggle("Evidence verifier pass", value=True,
+    with st.expander("Advanced override"):
+        st.caption(
+            "By default the selected depth decides which agents, verifier, and "
+            "embeddings run. Enable this to override them manually."
+        )
+        override = st.toggle("Override depth settings", value=False)
+        run_security = st.checkbox("Security", value="security" in profile.agent_keys)
+        run_correctness = st.checkbox("Correctness / regression",
+                                      value="correctness" in profile.agent_keys)
+        run_performance = st.checkbox("Performance",
+                                      value="performance" in profile.agent_keys)
+        run_api = st.checkbox("API & DB contracts",
+                              value="api_contract" in profile.agent_keys)
+        run_tests = st.checkbox("Test coverage",
+                                value="test_coverage" in profile.agent_keys)
+        run_arch = st.checkbox("Architecture",
+                               value="architecture" in profile.agent_keys)
+        verify = st.toggle("Evidence verifier pass", value=profile.verify,
                            help="Second pass that drops unsupported findings.")
         use_embeddings = st.toggle(
             "Embedding index (semantic search)",
-            value=True,
+            value=profile.use_embeddings,
             help="Builds a local embedding index for semantic context retrieval. "
                  "Requires sentence-transformers.",
         )
+
+    review_config = st.toggle(
+        "Also review config/lock files",
+        value=False,
+        help="By default, lock files (package-lock.json…), dependency manifests "
+             "(requirements.txt, package.json…), and binary/generated files are skipped. "
+             "Enable to review config/manifest files too. Binary/lock files stay skipped.",
+    )
+
+    # Effective settings: profile drives everything unless overridden.
+    want_embeddings = use_embeddings if override else profile.use_embeddings
 
     with st.expander("AWS credentials (optional)"):
         st.caption("Leave blank to use the default boto3 chain.")
@@ -205,7 +239,7 @@ if target_diff is not None:
                 cg = build_graph(src_path)
 
             embed_idx = None
-            if use_embeddings and not dossier_only:
+            if want_embeddings and not dossier_only:
                 with st.spinner("Building embedding index (semantic search)..."):
                     try:
                         from pr_review.embeddings import build_index
@@ -265,23 +299,27 @@ if target_diff is not None:
             st.stop()
 
         # ── 4. full review ────────────────────────────────────────────────────
-        # build agent list from checkboxes
-        from pr_review.agents import (
-            ALL_AGENTS, SecurityAgent, CorrectnessAgent,
-            PerformanceAgent, ApiContractAgent, TestCoverageAgent, ArchitectureAgent,
-        )
-        agent_map = {
-            SecurityAgent: run_security,
-            CorrectnessAgent: run_correctness,
-            PerformanceAgent: run_performance,
-            ApiContractAgent: run_api,
-            TestCoverageAgent: run_tests,
-            ArchitectureAgent: run_arch,
-        }
-        active_agents = [cls() for cls, enabled in agent_map.items() if enabled]
-        if not active_agents:
-            st.warning("No agents selected. Enable at least one in the sidebar.")
-            st.stop()
+        # Profile drives agents/verify; the Advanced override can replace them.
+        active_agents = None
+        verify_eff = profile.verify
+        if override:
+            from pr_review.agents import (
+                SecurityAgent, CorrectnessAgent, PerformanceAgent,
+                ApiContractAgent, TestCoverageAgent, ArchitectureAgent,
+            )
+            agent_map = {
+                SecurityAgent: run_security,
+                CorrectnessAgent: run_correctness,
+                PerformanceAgent: run_performance,
+                ApiContractAgent: run_api,
+                TestCoverageAgent: run_tests,
+                ArchitectureAgent: run_arch,
+            }
+            active_agents = [cls() for cls, enabled in agent_map.items() if enabled]
+            verify_eff = verify
+            if not active_agents:
+                st.warning("Override is on but no agents selected. Enable at least one.")
+                st.stop()
 
         from pr_review.llm import NovaClient
         nova = NovaClient(
@@ -293,10 +331,15 @@ if target_diff is not None:
         from pr_review.review import run_review, format_report
 
         progress = st.progress(0.0, text="Running specialist agents...")
-        n_files = max(len(touched_files), 1)
 
-        with st.spinner(f"Reviewing {n_files} file(s) with "
-                        f"{len(active_agents)} specialist agent(s)..."):
+        def _progress(kind, i, n, path):
+            if kind == "file":
+                frac = min(0.9, i / max(n, 1))
+                progress.progress(frac, text=f"Reviewing file {i + 1}/{n}: {path}")
+            elif kind == "dependency":
+                progress.progress(0.95, text="Checking cross-file dependencies...")
+
+        with st.spinner(f"Reviewing at **{profile.key}** depth..."):
             overall = run_review(
                 cg=cg,
                 changes=changes,
@@ -306,8 +349,11 @@ if target_diff is not None:
                 nova=nova,
                 embed_index=embed_idx,
                 token_budget=token_budget,
-                verify=verify,
+                profile=profile,
                 agents=active_agents,
+                verify=verify_eff if override else None,
+                progress_cb=_progress,
+                review_config=review_config,
             )
         progress.progress(1.0, text="Done.")
 
@@ -331,52 +377,110 @@ if target_diff is not None:
 if ss.overall is not None:
     overall = ss.overall
 
-    # ── overall risk banner ───────────────────────────────────────────────────
-    risk_color = RISK_COLORS.get(overall.risk_level, "#5F5E5A")
-    st.markdown(
-        f"<h2>Overall risk: "
-        f"<span style='color:{risk_color}'>{overall.risk_level.upper()} "
-        f"({overall.risk_score}/100)</span></h2>",
-        unsafe_allow_html=True,
-    )
-    m = overall.metrics
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total findings", len(overall.all_findings))
-    c2.metric("Verifier dropped", overall.dropped_total)
-    c3.metric("Sensitive changes", int(m.get("sensitive_changes", 0)))
-    c4.metric("No-test changes", int(m.get("changes_without_tests", 0)))
+    # ── summary dashboard (counts by severity, not a risk score) ──────────────
+    SEV_ORDER = ["critical", "high", "medium", "low", "info"]
+
+    def _sev_counts(findings):
+        counts = {s: 0 for s in SEV_ORDER}
+        for f in findings:
+            counts[f.severity] = counts.get(f.severity, 0) + 1
+        return counts
+
+    # in-file issues exclude breaking (breaking shown as its own tile/section)
+    file_issue_findings = [
+        f for fr in overall.file_results.values() for f in fr.findings
+        if f.kind == "issue"
+    ]
+    sev = _sev_counts(file_issue_findings)
+
+    st.subheader("Summary")
+    st.caption(f"Review depth: **{overall.profile_key.upper()}**")
+    cols = st.columns(6)
+    cols[0].metric("🔴 Critical", sev["critical"])
+    cols[1].metric("🟠 High", sev["high"])
+    cols[2].metric("🟡 Medium", sev["medium"])
+    cols[3].metric("🔵 Low", sev["low"])
+    cols[4].metric("💥 Breaking", len(overall.breaking))
+    cols[5].metric("💡 Suggestions", len(overall.suggestions))
+
+    # ── breaking-change banner (cross-file, Standard/Deep) ────────────────────
+    if overall.breaking:
+        st.error(
+            f"⚠️ **{len(overall.breaking)} breaking change(s)** — these calls in other "
+            f"files were not updated and will break."
+        )
+        for f in overall.breaking:
+            with st.expander(
+                f"💥 {f.severity.upper()} · `{f.file}:{f.line}` · {f.title}",
+                expanded=True,
+            ):
+                st.write(f.explanation)
+                if f.evidence:
+                    st.code(f.evidence, language="python")
+                if f.recommendation:
+                    st.info(f.recommendation)
+
+    # ── dependent callers checked (Standard/Deep) ────────────────────────────
+    if overall.dependencies:
+        n_callers = sum(len(dv.callers) for dv in overall.dependencies)
+        st.subheader(f"🔗 Dependent callers checked ({n_callers} in other files)")
+        st.caption(
+            "Functions in OTHER files that call the code you changed. These were "
+            "checked for breakage (Standard/Deep). 💥 = flagged as broken."
+        )
+        by_changed_file = {}
+        for dv in overall.dependencies:
+            by_changed_file.setdefault(dv.changed_file, []).append(dv)
+        for cfile in sorted(by_changed_file):
+            st.markdown(f"**Changed in `{cfile}`:**")
+            for dv in by_changed_file[cfile]:
+                label = (f"`{dv.changed_qualname}` ({dv.change_type}) — "
+                         f"{len(dv.callers)} caller(s)")
+                with st.expander(label):
+                    for cr in dv.callers:
+                        flag = "💥 " if cr.broken else "↳ "
+                        st.markdown(f"{flag}**`{cr.qualname}`** · `{cr.file}:{cr.line}`")
+                        st.code(cr.source, language="python")
 
     if not overall.all_findings:
         st.success("✅ No issues found across all changed files.")
 
-    # ── per-file tabs ─────────────────────────────────────────────────────────
-    files_with_findings = {fp for fp, fr in overall.file_results.items() if fr.findings}
-    files_clean = {fp for fp, fr in overall.file_results.items() if not fr.findings}
+    # ── per-file tabs (issues only; suggestions shown separately) ─────────────
+    def _issue_count(fr) -> int:
+        return sum(1 for f in fr.findings if f.kind == "issue")
+
+    files_with_findings = {fp for fp, fr in overall.file_results.items() if _issue_count(fr)}
+    files_clean = {fp for fp, fr in overall.file_results.items() if not _issue_count(fr)}
 
     if files_with_findings:
         st.subheader("Findings by file")
         tab_paths = sorted(files_with_findings)
         tab_labels = []
+        def _top_sev(fr) -> str:
+            for s in SEV_ORDER:
+                if any(f.kind == "issue" and f.severity == s for f in fr.findings):
+                    return s
+            return "info"
+
         for fp in tab_paths:
             fr = overall.file_results[fp]
-            badge = SEV_BADGE.get(fr.risk_level, "⚪")
+            badge = SEV_BADGE.get(_top_sev(fr), "⚪")
             fn = fp.split("/")[-1]
-            n = len(fr.findings)
+            n = _issue_count(fr)
             nc = fr.num_chunks
-            tab_labels.append(f"{badge} {fn} ({n} finding{'s' if n != 1 else ''}, {nc} chunk{'s' if nc != 1 else ''})")
+            tab_labels.append(f"{badge} {fn} ({n} issue{'s' if n != 1 else ''}, {nc} chunk{'s' if nc != 1 else ''})")
 
         tabs = st.tabs(tab_labels)
         for tab, fpath in zip(tabs, tab_paths):
             fr = overall.file_results[fpath]
             with tab:
-                # file-level header
-                color = RISK_COLORS.get(fr.risk_level, "#5F5E5A")
+                # file-level header (severity breakdown, not a risk score)
+                fsev = _sev_counts([f for f in fr.findings if f.kind == "issue"])
                 st.markdown(
-                    f"**`{fpath}`** — risk "
-                    f"<span style='color:{color}'><b>{fr.risk_level.upper()} "
-                    f"({fr.risk_score}/100)</b></span> "
-                    f"— {fr.num_chunks} chunk(s) reviewed independently",
-                    unsafe_allow_html=True,
+                    f"**`{fpath}`** — "
+                    f"🔴 {fsev['critical']}  🟠 {fsev['high']}  "
+                    f"🟡 {fsev['medium']}  🔵 {fsev['low']}  "
+                    f"— {fr.num_chunks} chunk(s) reviewed independently"
                 )
                 st.caption(
                     f"~{fr.dossier_tokens} tokens total · "
@@ -388,18 +492,23 @@ if ss.overall is not None:
                     with st.expander(f"Chunk breakdown ({fr.num_chunks} chunk(s))", expanded=False):
                         for cr in fr.chunk_results:
                             ch = cr.chunk
-                            lines_str = (
-                                f"{ch.added_lines[0]}–{ch.added_lines[-1]}"
-                                if len(ch.added_lines) > 1
-                                else str(ch.added_lines[0])
-                            )
+                            span_str = f"{ch.start_line}-{ch.end_line}"
+                            if ch.added_lines:
+                                changed_str = (
+                                    f"{ch.added_lines[0]}–{ch.added_lines[-1]}"
+                                    if len(ch.added_lines) > 1
+                                    else str(ch.added_lines[0])
+                                )
+                            else:
+                                changed_str = "none (context only)"
                             nodes_str = ", ".join(
                                 n.split("::")[-1] for n in ch.node_ids
                             ) or "no mapped nodes"
                             n_raw = len(cr.findings)
                             st.markdown(
                                 f"**Chunk {ch.chunk_index + 1}/{ch.total_chunks}** — "
-                                f"lines `{lines_str}` — `{nodes_str}` — "
+                                f"file lines `{span_str}` · changed `{changed_str}` — "
+                                f"`{nodes_str}` — "
                                 f"{n_raw} raw finding(s) before dedup/verify"
                             )
                             if ch.dossier:
@@ -412,13 +521,14 @@ if ss.overall is not None:
 
                 st.divider()
 
-                # ── findings ─────────────────────────────────────────────────
-                if not fr.findings:
+                # ── findings (issues only) ───────────────────────────────────
+                file_issues = [f for f in fr.findings if f.kind == "issue"]
+                if not file_issues:
                     st.success("No issues found in this file.")
                 else:
-                    st.markdown(f"**{len(fr.findings)} finding(s) after dedup + verify:**")
+                    st.markdown(f"**{len(file_issues)} issue(s) after dedup + verify:**")
 
-                for i, finding in enumerate(fr.findings, 1):
+                for i, finding in enumerate(file_issues, 1):
                     sev = finding.severity.upper()
                     badge = SEV_BADGE.get(finding.severity, "⚪")
                     label = f"{badge} {sev} · line {finding.line} · {finding.title}"
@@ -445,6 +555,27 @@ if ss.overall is not None:
         with st.expander(f"✅ Clean files ({len(files_clean)}) — no issues found"):
             for fp in sorted(files_clean):
                 st.markdown(f"- `{fp}`")
+
+    if overall.skipped_files:
+        with st.expander(
+            f"⏭️ Skipped files ({len(overall.skipped_files)}) — lock/binary/config, not reviewed"
+        ):
+            st.caption("Enable 'Also review config/lock files' in the sidebar to include manifests.")
+            for fp in sorted(overall.skipped_files):
+                st.markdown(f"- `{fp}`")
+
+    # ── suggestions (improvements, every tier) ────────────────────────────────
+    suggestions = overall.suggestions
+    st.subheader(f"💡 Suggestions ({len(suggestions)})")
+    if not suggestions:
+        st.caption("No suggestions.")
+    else:
+        for f in suggestions:
+            with st.expander(f"💡 `{f.file}:{f.line}` · {f.title}"):
+                st.markdown(f"**Category:** `{f.category}`")
+                st.write(f.explanation)
+                if f.recommendation:
+                    st.info(f.recommendation)
 
     # ── download + dossier ────────────────────────────────────────────────────
     st.divider()
