@@ -445,6 +445,8 @@ class CodeGraph:
     _by_simple: Dict[str, List[str]] = field(default_factory=dict)
     # language breakdown: lang -> count
     lang_counts: Dict[str, int] = field(default_factory=dict)
+    # Lazily built index: path -> [(start_line, end_line, node_id)]
+    _line_index: Dict[str, List[Tuple[int, int, str]]] = field(default_factory=dict)
 
     def node(self, nid: str) -> dict:
         return self.g.nodes[nid]
@@ -456,11 +458,21 @@ class CodeGraph:
         return [n for n, d in self.g.nodes(data=True)
                 if d.get("path") == path and d.get("kind") != "file"]
 
+    def _ensure_line_index(self, path: str) -> None:
+        if path in self._line_index:
+            return
+        entries: List[Tuple[int, int, str]] = []
+        for n, d in self.g.nodes(data=True):
+            if d.get("path") == path and d.get("kind") != "file":
+                s, e = d.get("start_line", 0), d.get("end_line", 0)
+                if s and e:
+                    entries.append((s, e, n))
+        self._line_index[path] = entries
+
     def node_for_line(self, path: str, line: int) -> Optional[str]:
+        self._ensure_line_index(path)
         best, best_span = None, None
-        for n in self.defs_in_file(path):
-            d = self.g.nodes[n]
-            s, e = d.get("start_line", 0), d.get("end_line", 0)
+        for s, e, n in self._line_index[path]:
             if s <= line <= e:
                 span = e - s
                 if best_span is None or span < best_span:

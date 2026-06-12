@@ -15,11 +15,14 @@ Strategy is hybrid (chosen with the user):
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Dict, Optional
 
 from .graph import CodeGraph
+
+log = logging.getLogger(__name__)
 
 # A function over this many source lines gets an LLM summary (if nova provided).
 LLM_SUMMARY_THRESHOLD = 40
@@ -134,6 +137,7 @@ def build_identity_card(
                 _SUMMARY_INSTRUCTIONS.format(source=src[:6000]),
             ).strip()
         except Exception:
+            log.exception("LLM summary failed for node %s; falling back to empty", node_id)
             card.summary = ""
 
     if cache is not None:

@@ -37,8 +37,8 @@ class NovaClient:
         self._client = boto3.client(
             "bedrock-runtime",
             region_name=region,
-            config=Config(connect_timeout=60, read_timeout=300,
-                          retries={"max_attempts": 2}),
+            config=Config(connect_timeout=30, read_timeout=120,
+                          retries={"max_attempts": 6, "mode": "adaptive"}),
             **creds,
         )
 
@@ -60,60 +60,39 @@ class NovaClient:
         return _extract_json(self.complete(system, user))
 
     # ── agentic tool loop ──────────────────────────────────────────────────────
-    def converse_with_tools(
-        self,
-        system: str,
-        messages: List[Dict],
-        tools: List[Dict],
-    ) -> List[Dict]:
-        """Single converse call with Bedrock tool_use support.
-
-        Returns the content block list from the assistant turn.
-        Each block is a dict: {"type": "text", "text": "..."} or
-        {"type": "tool_use", "id": "...", "name": "...", "input": {...}}.
-        """
-        # Convert our tool schema to Bedrock format
-        bedrock_tools = []
-        for t in tools:
-            bedrock_tools.append({
-                "toolSpec": {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "inputSchema": {"json": t["input_schema"]},
-                }
-            })
+    def converse_with_tools(self, system, messages, tools):
+        bedrock_tools = [{
+            "toolSpec": {
+                "name": t["name"],
+                "description": t["description"],
+                "inputSchema": {"json": t["input_schema"]},
+            }
+        } for t in tools]
 
         kwargs = dict(
             modelId=self.model_id,
             system=[{"text": system}],
             messages=messages,
-            inferenceConfig={
-                "maxTokens": self.max_tokens,
-                "temperature": self.temperature,
-                "topP": self.top_p,
-            },
+            inferenceConfig={"maxTokens": self.max_tokens,
+                            "temperature": self.temperature, "topP": self.top_p},
         )
         if bedrock_tools:
             kwargs["toolConfig"] = {"tools": bedrock_tools}
 
         resp = self._client.converse(**kwargs)
-        content = resp["output"]["message"]["content"]
+        return resp["output"]["message"]["content"]   # RAW bedrock blocks
 
-        # normalise to list of dicts with "type"
-        result: List[Dict] = []
+    @staticmethod
+    def normalize_blocks(content):
+        out = []
         for block in content:
             if "text" in block:
-                result.append({"type": "text", "text": block["text"]})
+                out.append({"type": "text", "text": block["text"]})
             elif "toolUse" in block:
                 tu = block["toolUse"]
-                result.append({
-                    "type": "tool_use",
-                    "id": tu.get("toolUseId", ""),
-                    "name": tu.get("name", ""),
-                    "input": tu.get("input", {}),
-                })
-        return result
-
+                out.append({"type": "tool_use", "id": tu.get("toolUseId", ""),
+                            "name": tu.get("name", ""), "input": tu.get("input", {})})
+        return out
 
 # ── JSON extraction ────────────────────────────────────────────────────────────
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)

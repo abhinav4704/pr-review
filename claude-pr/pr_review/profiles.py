@@ -17,7 +17,7 @@ single config object that gates:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List
 
 
@@ -26,7 +26,9 @@ class ReviewProfile:
     key: str                     # "quick" | "standard" | "deep"
     label: str                   # human label for the UI
     description: str             # one-line UI helper
-    agent_keys: List[str]        # which agents to instantiate (see agents.AGENT_REGISTRY)
+    agent_keys: List[str]        # union of both passes — kept for backward compat
+    whole_file_agent_keys: List[str]   # Pass 1: agents that see the full file source
+    changed_fn_agent_keys: List[str]   # Pass 2: agents that see changed fns + callers/callees
     cross_file: bool             # reserved/unused: file review now always sends the whole file;
                                  # cross-file reasoning lives in the breaking-change pass below
     caller_compat: bool          # run the breaking-change pass (the only cross-file work)
@@ -39,6 +41,8 @@ QUICK = ReviewProfile(
     label="Quick — file only",
     description="Basic checks (bugs + exposed secrets) on the changed code only. No cross-file work.",
     agent_keys=["security", "correctness"],
+    whole_file_agent_keys=["security"],
+    changed_fn_agent_keys=["correctness"],
     cross_file=False,
     caller_compat=False,
     use_embeddings=False,
@@ -49,7 +53,9 @@ STANDARD = ReviewProfile(
     key="standard",
     label="Standard — + dependents",
     description="Quick, plus checks whether changed functions break callers in other files.",
-    agent_keys=["security", "correctness", "api_contract"],
+    agent_keys=["security", "correctness", "api_contract", "architecture"],
+    whole_file_agent_keys=["security", "architecture"],
+    changed_fn_agent_keys=["security", "correctness", "api_contract", "architecture"],
     cross_file=True,
     caller_compat=True,
     use_embeddings=False,
@@ -61,7 +67,9 @@ DEEP = ReviewProfile(
     label="Deep — architecture & security",
     description="Everything: full security, performance, architecture review, and suggestions.",
     agent_keys=["security", "correctness", "performance",
-                "api_contract", "test_coverage", "architecture"],
+                "api_contract", "architecture"],
+    whole_file_agent_keys=["security", "architecture", "performance"],
+    changed_fn_agent_keys=["security", "correctness", "api_contract", "architecture"],
     cross_file=True,
     caller_compat=True,
     use_embeddings=True,

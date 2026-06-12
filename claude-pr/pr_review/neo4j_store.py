@@ -132,8 +132,8 @@ class Neo4jStore:
         if not self._available:
             return []
         rows = self._run(
-            "MATCH (caller:Node)-[:CALLS*1..{d}]->(n:Node {{id: $id}}) "
-            "RETURN DISTINCT caller.id AS id".replace("{d}", str(depth)),
+            f"MATCH (caller:Node)-[:CALLS*1..{int(depth)}]->(n:Node {{id: $id}}) "
+            "RETURN DISTINCT caller.id AS id",
             {"id": node_id},
         )
         return [r["id"] for r in rows]

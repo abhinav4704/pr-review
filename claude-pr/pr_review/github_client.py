@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 import tarfile
 import tempfile
@@ -10,6 +11,8 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import requests
+
+log = logging.getLogger(__name__)
 
 API = "https://api.github.com"
 DIFF_ACCEPT = "application/vnd.github.diff"
@@ -37,7 +40,12 @@ class GitHubClient:
             raise GitHubError("A GitHub PAT is required.")
         self.token = token
         self.s = requests.Session()
-        self.s.verify = False
+        if os.environ.get("PR_REVIEW_INSECURE_TLS") == "1":
+            self.s.verify = False
+            log.warning(
+                "TLS certificate verification is DISABLED (PR_REVIEW_INSECURE_TLS=1). "
+                "Your GitHub PAT is not protected against MITM attacks."
+            )
         self.s.headers.update({
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
@@ -119,6 +127,13 @@ class GitHubClient:
             try:
                 tf.extractall(dest, filter="data")
             except TypeError:
-                tf.extractall(dest)
+                # Python < 3.12 fallback: validate paths to prevent traversal.
+                safe = []
+                dest_real = os.path.realpath(dest)
+                for m in tf.getmembers():
+                    target = os.path.realpath(os.path.join(dest, m.name))
+                    if target.startswith(dest_real + os.sep) or target == dest_real:
+                        safe.append(m)
+                tf.extractall(dest, members=safe)
         top = members[0].split("/", 1)[0] if members else ""
         return os.path.join(dest, top) if top else dest

@@ -8,7 +8,7 @@ is actually in the PR, on its new-side line numbers.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
 from .graph import CodeGraph
@@ -63,6 +63,8 @@ def parse_diff(diff_text: str) -> List[FileDiff]:
             new_lineno += 1
         elif line.startswith("-") and not line.startswith("---"):
             pass  # removed line; does not advance new-side counter
+        elif line.startswith("\\"):
+            pass  # "\ No newline at end of file" — not a real line
         else:
             # context line: advances new-side line counter
             if new_lineno:
@@ -101,7 +103,9 @@ def map_changes(cg: CodeGraph, file_diffs: List[FileDiff]) -> List[ChangedNode]:
         d = cg.node(node_id)
         if d["path"] in added_files:
             ctype = "added"
-        elif d["start_line"] in lines:
+        elif any(ln <= d["start_line"] + 5 for ln in lines):
+            # Any added line within 5 lines of the node's start is a signature
+            # change (covers decorators, the def keyword, and multi-line params).
             ctype = "signature"
         else:
             ctype = "behavior"

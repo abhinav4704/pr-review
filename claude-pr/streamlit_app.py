@@ -72,7 +72,7 @@ with st.sidebar:
     st.divider()
     st.header("⚙️ Review options")
 
-    from pr_review.profiles import PROFILES, QUICK, STANDARD, DEEP
+    from pr_review.profiles import QUICK, STANDARD, DEEP
 
     depth_choices = {QUICK.label: QUICK, STANDARD.label: STANDARD, DEEP.label: DEEP}
     depth_label = st.radio(
@@ -403,6 +403,23 @@ if ss.overall is not None:
     cols[4].metric("💥 Breaking", len(overall.breaking))
     cols[5].metric("💡 Suggestions", len(overall.suggestions))
 
+    # ── top-level agent error banner ──────────────────────────────────────────
+    all_agent_runs = [
+        r
+        for fr in overall.file_results.values()
+        for cr in fr.chunk_results
+        for r in cr.agent_runs
+    ]
+    agent_errors = [r for r in all_agent_runs if ":ERROR:" in r]
+    if agent_errors:
+        st.warning(
+            f"⚠ **{len(agent_errors)} agent run(s) failed** — findings may be incomplete. "
+            f"Check chunk breakdowns below for details."
+        )
+        with st.expander("Agent error details"):
+            for err in agent_errors:
+                st.error(err)
+
     # ── breaking-change banner (cross-file, Standard/Deep) ────────────────────
     if overall.breaking:
         st.error(
@@ -518,6 +535,14 @@ if ss.overall is not None:
                                     expanded=False,
                                 ):
                                     st.code(ch.dossier, language="markdown")
+                            # Agent run status — show errors prominently
+                            errors = [r for r in cr.agent_runs if ":ERROR:" in r]
+                            ok_runs = [r for r in cr.agent_runs if ":ERROR:" not in r]
+                            if errors:
+                                for err in errors:
+                                    st.error(f"Agent error: {err}")
+                            if ok_runs:
+                                st.caption(f"Agents ran: {', '.join(ok_runs)}")
 
                 st.divider()
 

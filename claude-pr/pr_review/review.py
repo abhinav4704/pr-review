@@ -1,25 +1,30 @@
-"""Per-file specialist agent orchestration (whole-file review).
+"""Per-file specialist agent orchestration — two-pass review.
 
-Pipeline per changed file:
+Pass 1 — whole-file sweep:
     1. Split the WHOLE file into definition-aware chunks  (context.make_file_chunks)
-       — one chunk if the file fits the budget, else split on function boundaries
     2. Render each chunk (full source, changed lines marked '+')
-    3. For each chunk, run every active agent   (agents.BaseAgent.run)
-       — each agent has an agentic tool loop to query the graph mid-reasoning
-    4. Merge findings from all chunks/agents
-    5. Deduplicate by (file, line, title)
-    6. Run evidence verifier over the combined dossier
-    7. Cross-file breaking-change pass over the changed (+) functions only
+    3. Run whole-file agents (security, architecture, performance)
 
-The model sees the entire file so it can judge whether the file works as a whole,
-while findings stay pinned to line numbers and prioritize the changed lines.
+Pass 2 — changed-function + dependency sweep:
+    4. Group added lines into proximity chunks             (context.make_chunks)
+    5. Build rich dossiers: changed fn + callers/callees/tests (context.build_chunk_dossier)
+    6. Run dependency-aware agents (security, correctness, api_contract, architecture)
+
+Both passes feed into:
+    7. Merge all candidates, deduplicate by (file, line, title)
+    8. Run evidence verifier over the combined dossier
+    9. Cross-file breaking-change pass over changed (+) functions only
 """
 
 from __future__ import annotations
 
+import ast
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+log = logging.getLogger(__name__)
 
 from .agents import (
     ALL_AGENTS,
@@ -32,9 +37,10 @@ from .agents import (
 from .blast import BlastResult
 from .context import (
     Chunk,
-    _slice_node,
+    _slice_node_capped,
+    build_all_chunk_dossiers,
     build_all_file_chunk_dossiers,
-    build_dossier,
+    make_chunks,
     make_file_chunks,
 )
 from .diff import (
@@ -47,7 +53,7 @@ from .diff import (
 from .filters import should_review
 from .graph import CodeGraph
 from .identity import IdentityCard, build_identity_card, render_card
-from .llm import NovaClient, _extract_json
+from .llm import NovaClient
 from .profiles import DEEP, ReviewProfile, build_agents
 
 if TYPE_CHECKING:
@@ -85,6 +91,10 @@ def _risk(metrics: Dict[str, float], findings: List[Finding]) -> Tuple[int, str]
     score = min(score, 100.0)
     level = ("low" if score < 25 else "medium" if score < 55
              else "high" if score < 80 else "critical")
+    # A file with any critical finding is never "low" or "medium" risk.
+    if any(f.severity == "critical" for f in findings) and level in ("low", "medium"):
+        score = max(score, 55.0)
+        level = "high"
     return int(round(score)), level
 
 
@@ -197,6 +207,7 @@ def _review_chunk(
             result.findings.extend(findings)
             result.agent_runs.append(agent.name)
         except Exception as e:
+            log.exception("Agent %s failed on chunk %s", agent.name, getattr(chunk, 'chunk_index', '?'))
             result.agent_runs.append(f"{agent.name}:ERROR:{e}")
     return result
 
@@ -214,40 +225,86 @@ def run_file_review(
     token_budget: int = 12000,
     verify: bool = True,
     agents: list = None,
+    profile: Optional[ReviewProfile] = None,
 ) -> FileReviewResult:
     result = FileReviewResult(file_path=file_path)
-    active_agents = agents if agents is not None else ALL_AGENTS
 
-    # 1. split the WHOLE file into definition-aware chunks (one if it fits)
-    chunks = make_file_chunks(cg, file_path, file_diff, token_budget=token_budget)
-    result.num_chunks = len(chunks)
+    # Deterministic syntax gate — no LLM tokens spent on unparseable files.
+    syntax_findings = _syntax_check(cg, file_diff)
 
-    if not chunks:
+    # Resolve agent sets: profile governs the split; agents= is a fallback
+    if profile is not None:
+        pass1_agents = build_agents(profile.whole_file_agent_keys)
+        pass2_agents = build_agents(profile.changed_fn_agent_keys)
+    else:
+        fallback = agents if agents is not None else ALL_AGENTS
+        pass1_agents = fallback
+        pass2_agents = fallback
+
+    all_candidates: List[Finding] = []
+
+    # Syntax findings go in first — they survive verification regardless.
+    all_candidates.extend(syntax_findings)
+
+    # ── PASS 1: whole-file sweep ──────────────────────────────────────────────
+    # Agents see the entire file (full source, + markers on changed lines).
+    # Good for: architecture patterns, performance hotspots, broad security sweep.
+    file_chunks = make_file_chunks(cg, file_path, file_diff, token_budget=token_budget)
+    result.num_chunks = len(file_chunks)
+
+    if not file_chunks:
+        # Syntax-broken or unreadable: surface the syntax findings and return.
+        if syntax_findings:
+            result.findings = syntax_findings
+            result.risk_score, result.risk_level = _risk({}, syntax_findings)
         return result
 
-    # 2. render each chunk's dossier (full source, changed lines marked '+')
-    build_all_file_chunk_dossiers(chunks, cg, file_path)
-    result.dossier_tokens = sum(_toks(c.dossier) for c in chunks)
+    build_all_file_chunk_dossiers(file_chunks, cg, file_path)
+    result.dossier_tokens = sum(_toks(c.dossier) for c in file_chunks)
 
-    # 3. review each chunk independently
-    all_candidates: List[Finding] = []
-    for chunk in chunks:
-        cr = _review_chunk(chunk, cg, embed_index, nova, active_agents)
+    for chunk in file_chunks:
+        cr = _review_chunk(chunk, cg, embed_index, nova, pass1_agents)
         result.chunk_results.append(cr)
         all_candidates.extend(cr.findings)
+
+    # ── PASS 2: changed-function + dependency sweep ───────────────────────────
+    # Agents see only the functions containing changed lines, plus their direct
+    # callers, callees, and covering tests from the code graph.
+    # Good for: correctness (caller contracts), security (data-flow context),
+    #           API contract breaks (callers shown explicitly).
+    if file_diff.added_lines:
+        prox_chunks = make_chunks(cg, file_path, file_diff, file_changes)
+        build_all_chunk_dossiers(
+            prox_chunks, cg, blast, file_changes,
+            embed_index=embed_index,
+            cross_file=True,
+        )
+        result.num_chunks += len(prox_chunks)
+        for chunk in prox_chunks:
+            cr = _review_chunk(chunk, cg, embed_index, nova, pass2_agents)
+            result.chunk_results.append(cr)
+            all_candidates.extend(cr.findings)
 
     if not all_candidates:
         result.risk_score, result.risk_level = 0, "low"
         return result
 
-    # 4. verifier over the combined dossier (all chunks joined)
-    combined = "\n\n---\n\n".join(c.dossier for c in chunks)
+    # ── verify + dedup ────────────────────────────────────────────────────────
+    # Include Pass 2 dossiers so the verifier has caller/callee context for
+    # findings that cite it; cap total to avoid blowing the verifier window.
+    _MAX_VERIFY_TOKS = 24_000
+    _CHARS = _MAX_VERIFY_TOKS * 4
+    combined_parts = [c.dossier for c in file_chunks]
+    if file_diff.added_lines:
+        combined_parts += [c.dossier for c in prox_chunks]
+    combined = "\n\n---\n\n".join(combined_parts)
+    if len(combined) > _CHARS:
+        combined = combined[-_CHARS:]  # keep most recent (Pass 2) context
     survivors = all_candidates
     if verify:
         survivors = _verify(combined, all_candidates, nova)
         result.dropped = len(all_candidates) - len(survivors)
 
-    # 5. deduplicate
     seen: set = set()
     deduped: List[Finding] = []
     for f in survivors:
@@ -260,7 +317,7 @@ def run_file_review(
     deduped.sort(key=lambda f: order.get(f.severity, 9))
     result.findings = deduped
 
-    # 6. per-file risk
+    # ── per-file risk ─────────────────────────────────────────────────────────
     file_node_ids = {ch.node_id for ch in file_changes}
     file_metrics: Dict[str, float] = {
         "changed_nodes": float(len(file_changes)),
@@ -301,7 +358,63 @@ def _toks(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def _syntax_check(cg: CodeGraph, fd: FileDiff) -> List[Finding]:
+    """Deterministic parse gate for Python files.
+
+    A file that won't parse is a guaranteed defect — flag it without spending any
+    LLM tokens, and prevent it from being silently dropped by the num_chunks==0
+    skip. Returns [] for non-Python files or files that parse cleanly.
+    """
+    if not fd.path.endswith(".py"):
+        return []
+    src = cg.source_lines(fd.path, 1, 10**9)  # whole file
+    if not src.strip():
+        return []
+    try:
+        ast.parse(src)
+        return []
+    except SyntaxError as e:
+        line = e.lineno or (min(fd.added_lines) if fd.added_lines else 0)
+        return [Finding(
+            category="syntax",
+            severity="critical",
+            file=fd.path,
+            line=int(line),
+            title="File does not parse (SyntaxError)",
+            explanation=(
+                f"{fd.path} cannot be parsed as Python ({e.msg} at line {e.lineno}). "
+                f"It will not import or run, so nothing else in it can be trusted "
+                f"until the error is fixed."
+            ),
+            evidence=(e.text or "").strip()[:200],
+            recommendation="Fix the syntax error so the file parses.",
+            kind="issue",
+        )]
+
 # ── Breaking-change (caller compatibility) pass ───────────────────────────────
+
+_MAX_DEP_CALLERS = 12     # max external callers sent to LLM per changed node
+_MAX_CALLER_SRC = 1500   # chars per caller source in the prompt
+
+
+def _norm_path(p: str) -> str:
+    """Normalize a path string for comparison (forward slashes, strip leading ./)."""
+    return p.replace("\\", "/").lstrip("./")
+
+
+def _paths_match(graph_path: str, llm_path: str) -> bool:
+    """True when graph_path and llm_path refer to the same file.
+
+    The LLM sometimes emits just the filename, a relative path with or without
+    leading './', or an absolute path.  We try three levels of match.
+    """
+    gn = _norm_path(graph_path)
+    ln = _norm_path(llm_path)
+    if gn == ln:
+        return True
+    # basename fallback (e.g. LLM says "foo.py", graph has "src/foo.py")
+    return gn.split("/")[-1] == ln.split("/")[-1]
+
 
 def _caller_line(cg: CodeGraph, caller_id: str) -> int:
     return int(cg.node(caller_id).get("start_line", 0)) if cg.has(caller_id) else 0
@@ -356,6 +469,9 @@ def run_dependency_check(
         if not ext_callers:
             continue
 
+        # Cap callers sent to LLM to avoid context-window overflow.
+        ext_callers = ext_callers[:_MAX_DEP_CALLERS]
+
         # record the dependency view (callers + their source) for the UI
         view = DependencyView(
             changed_node_id=ch.node_id,
@@ -381,7 +497,9 @@ def run_dependency_check(
             continue
         old_sig = old_signature_for(diff_text, cg, ch.node_id)
         callers_block = "\n\n".join(
-            _slice_node(cg, c, f"CALLER ({cg.node(c).get('path')}:{_caller_line(cg, c)})")
+            _slice_node_capped(cg, c,
+                               f"CALLER ({cg.node(c).get('path')}:{_caller_line(cg, c)})",
+                               _MAX_CALLER_SRC)
             for c in ext_callers
         )
         prompt = DEPENDENCY_INSTRUCTIONS.format(
@@ -392,6 +510,7 @@ def run_dependency_check(
         try:
             raw = nova.complete(DEPENDENCY_SYSTEM, prompt)
         except Exception:
+            log.exception("Dependency check failed for node %s", ch.node_id)
             continue
         broken_files = set()
         for f in _parse_findings(raw):
@@ -401,9 +520,9 @@ def run_dependency_check(
                 f.severity = "high"
             out.append(f)
             broken_files.add((f.file, f.line))
-        # mark which callers were flagged broken (best-effort by file:line)
+        # mark which callers were flagged broken — normalize paths before comparing
         for cref in view.callers:
-            if any(cref.file == bf and abs(cref.line - bl) <= 50
+            if any(_paths_match(cref.file, bf) and abs(cref.line - bl) <= 50
                    for bf, bl in broken_files):
                 cref.broken = True
 
@@ -429,8 +548,6 @@ def run_review(
 ) -> OverallResult:
     # Resolve the profile (default to DEEP = run everything, the legacy behavior).
     profile = profile or DEEP
-    if agents is None:
-        agents = build_agents(profile.agent_keys)
     if verify is None:
         verify = profile.verify
 
@@ -464,8 +581,9 @@ def run_review(
             token_budget=token_budget,
             verify=verify,
             agents=agents,
+            profile=profile,
         )
-        if file_result.num_chunks == 0:
+        if file_result.num_chunks == 0 and not file_result.findings:
             continue          # unreadable / non-source file with no content
         overall.file_results[fd.path] = file_result
         overall.all_findings.extend(file_result.findings)

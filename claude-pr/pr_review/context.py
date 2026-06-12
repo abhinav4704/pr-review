@@ -27,8 +27,8 @@ findings stay pinned to exact line numbers within the chunk.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List, Optional, Set
 
 from .blast import BlastResult
 from .diff import ChangedNode, FileDiff
@@ -103,6 +103,20 @@ def _slice_node(cg: CodeGraph, node_id: str, label: str) -> str:
         f"({d['path']}:{d['start_line']}-{d['end_line']})"
     )
     src = cg.source(node_id)
+    return f"{header}\n{src}" if src else header
+
+
+def _slice_node_capped(cg: CodeGraph, node_id: str, label: str,
+                       max_chars: int = 1500) -> str:
+    """Like _slice_node but truncates source to max_chars with a marker."""
+    d = cg.node(node_id)
+    header = (
+        f"# {label}: {d.get('qualname') or d.get('name', '')}  "
+        f"({d['path']}:{d['start_line']}-{d['end_line']})"
+    )
+    src = cg.source(node_id)
+    if src and len(src) > max_chars:
+        src = src[:max_chars] + "\n# ... (truncated)"
     return f"{header}\n{src}" if src else header
 
 
@@ -226,7 +240,7 @@ def build_chunk_dossier(
     emit_group("Indirect callers", callers_far, "CALLER (indirect)")
 
     if not any("Covering tests" in p for p in parts):
-        add(f"### Covering tests\n_No tests found for this chunk._\n")
+        add("### Covering tests\n_No tests found for this chunk._\n")
 
     return "\n".join(parts)
 

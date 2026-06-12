@@ -19,8 +19,7 @@ The loop terminates when the agent emits findings JSON or hits the round limit.
 from __future__ import annotations
 
 import json
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .graph import CodeGraph
@@ -29,7 +28,7 @@ from .llm import NovaClient
 if TYPE_CHECKING:
     from .embeddings import EmbeddingIndex
 
-MAX_TOOL_ROUNDS = 4
+MAX_TOOL_ROUNDS = 2
 
 # ── Tool definitions sent to agents ───────────────────────────────────────────
 TOOLS = [
@@ -231,54 +230,51 @@ class BaseAgent:
     system_prompt: str = ""
     category: str = "code-quality"
 
-    def run(
-        self,
-        dossier: str,
-        cg: CodeGraph,
-        embed_index: Optional["EmbeddingIndex"],
-        nova: NovaClient,
-    ) -> List[Finding]:
-        """Run the agentic tool loop then return findings."""
+    def run(self, dossier, cg, embed_index, nova):
         messages = [{"role": "user", "content": [{"text": self._user_prompt(dossier)}]}]
         findings: List[Finding] = []
 
         for _round in range(MAX_TOOL_ROUNDS + 1):
-            # ask Nova (with tools enabled)
-            resp = nova.converse_with_tools(
-                system=self.system_prompt,
-                messages=messages,
-                tools=TOOLS,
-            )
-            # collect text + tool use blocks from the response
-            tool_uses = [b for b in resp if b.get("type") == "tool_use"]
-            text_blocks = [b["text"] for b in resp if b.get("type") == "text"]
+            raw_content = nova.converse_with_tools(self.system_prompt, messages, TOOLS)
+            blocks = NovaClient.normalize_blocks(raw_content)
 
-            # if the agent returned findings text, parse and stop
-            for text in text_blocks:
-                found = _parse_findings(text)
-                if found:
-                    findings.extend(found)
+            tool_uses = [b for b in blocks if b["type"] == "tool_use"]
+            for b in blocks:
+                if b["type"] == "text":
+                    findings.extend(_parse_findings(b["text"]))
 
             if not tool_uses:
-                break  # no more tool calls → agent is done
+                break
 
-            # execute each tool and append tool_result to messages
-            # append assistant turn
-            messages.append({"role": "assistant", "content": resp})
-            # append tool results
-            tool_results = []
-            for tu in tool_uses:
-                result_text = execute_tool(tu["name"], tu.get("input", {}),
-                                           cg, embed_index)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tu["id"],
-                    "content": result_text,
-                })
-            messages.append({"role": "user", "content": tool_results})
+            messages.append({"role": "assistant", "content": raw_content})
+            messages.append({"role": "user", "content": [
+                {"toolResult": {
+                    "toolUseId": tu["id"],
+                    "content": [{"text": execute_tool(tu["name"], tu["input"], cg, embed_index)}],
+                }}
+                for tu in tool_uses
+            ]})
 
-        return findings
+        # Fallback: tools were used but no findings emitted. Give one more turn to
+        # respond to the pending tool results. No new message is appended (that would
+        # break role alternation), and TOOLS stays passed so toolConfig remains valid.
+        if not findings and len(messages) > 1 and messages[-1]["role"] == "user":
+            for b in NovaClient.normalize_blocks(
+                nova.converse_with_tools(self.system_prompt, messages, TOOLS)
+            ):
+                if b["type"] == "text":
+                    findings.extend(_parse_findings(b["text"]))
 
+        # Dedup within this agent's run to suppress restated partials across rounds.
+        seen: set = set()
+        deduped: List[Finding] = []
+        for f in findings:
+            key = (f.file, f.line, f.title[:40])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(f)
+        return deduped
+    
     def _user_prompt(self, dossier: str) -> str:
         return (
             f"You are the {self.name} specialist. Below is the FULL content of a file "

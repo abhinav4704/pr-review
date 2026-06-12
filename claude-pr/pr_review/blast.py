@@ -77,9 +77,13 @@ def _covering_tests(cg: CodeGraph, node_id: str) -> Set[str]:
         if cg.node(caller).get("is_test"):
             tests.add(caller)
     simple = cg.node(node_id).get("name", "")
-    for n, d in cg.g.nodes(data=True):
-        if d.get("is_test") and simple.lower() in d.get("name", "").lower():
-            tests.add(n)
+    # Require the function name to appear as a word segment in the test name,
+    # and skip names shorter than 4 chars to avoid noise (e.g. "get" in "test_widget").
+    if len(simple) >= 4:
+        pattern = re.compile(r"(?:^|_)" + re.escape(simple.lower()) + r"(?:_|$)")
+        for n, d in cg.g.nodes(data=True):
+            if d.get("is_test") and pattern.search(d.get("name", "").lower()):
+                tests.add(n)
     return tests
 
 

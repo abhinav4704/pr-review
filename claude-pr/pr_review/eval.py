@@ -38,6 +38,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+from .profiles import ReviewProfile
 from .blast import blast_radius
 from .diff import map_changes, parse_diff
 from .graph import build_graph
@@ -66,9 +67,12 @@ Actual findings from the system (may be empty):
 Return JSON:
 {{
   "matched": true | false,
-  "matched_index": int | null,   // index of the matching actual finding, or null
+  "matched_index": int | null,   // the value of the "index" field from the matching actual finding, or null
   "reason": "one sentence"
 }}
+
+IMPORTANT: matched_index must be the value of the "index" field in the actual findings list above,
+not the list position. Return null if no finding matches.
 """
 
 
@@ -175,6 +179,7 @@ def _judge(
     expected: ExpectedFinding,
     actuals: List[Dict],
     nova: NovaClient,
+    valid_indices: Optional[set] = None,
 ) -> Tuple[bool, Optional[int], str]:
     """Use the LLM judge to decide if the expected finding was correctly identified."""
     exp_str = json.dumps({
@@ -197,8 +202,12 @@ def _judge(
     if idx is not None:
         try:
             idx = int(idx)
+            # Validate that the returned index is a real global index.
+            if valid_indices is not None and idx not in valid_indices:
+                idx = None  # model returned a filtered-list position or invalid value
         except (TypeError, ValueError):
             idx = None
+    # Policy: if matched=true but index is invalid/null, count as TP with no index.
     return matched, idx, str(raw.get("reason", ""))
 
 
@@ -209,6 +218,7 @@ def run_eval(
     token_budget: int = 8000,
     verify: bool = True,
     agents: list = None,
+    profile: Optional[ReviewProfile] = None,
 ) -> EvalResults:
     results = EvalResults()
 
@@ -230,6 +240,7 @@ def run_eval(
             token_budget=token_budget,
             verify=verify,
             agents=agents,
+            profile=profile,
         )
         latency = time.time() - t0
 
@@ -239,6 +250,8 @@ def run_eval(
              "severity": f.severity, "title": f.title, "explanation": f.explanation}
             for i, f in enumerate(overall.all_findings)
         ]
+        # The set of valid global indices; used to validate judge's matched_index.
+        valid_global_indices = {d["index"] for d in actual_dicts}
 
         case_result = CaseResult(
             case_name=case.name,
@@ -253,7 +266,8 @@ def run_eval(
         for expected in case.expected_findings:
             # filter actual findings to the same file for efficiency
             file_actuals = [d for d in actual_dicts if d["file"] == expected.file]
-            matched, idx, reason = _judge(expected, file_actuals, nova)
+            matched, idx, reason = _judge(expected, file_actuals, nova,
+                                          valid_indices=valid_global_indices)
             detail = EvalFinding(
                 expected=expected,
                 matched=matched,
@@ -268,9 +282,9 @@ def run_eval(
             else:
                 case_result.false_negatives += 1
 
-        # false positives: actual findings not matched by any expected
+        # FP = actual findings with a valid global index not matched by any expected.
         case_result.false_positives = (
-            len(overall.all_findings) - len(matched_actual_indices)
+            len(valid_global_indices) - len(matched_actual_indices)
         )
 
         results.case_results.append(case_result)

@@ -40,8 +40,10 @@ IGNORE_SUFFIXES = (
 )
 
 # Dependency manifests / config — skipped by default, opt-in via include_config.
+# setup.py is intentionally excluded: it can contain arbitrary build/install code
+# that is worth reviewing (e.g. injected commands, secret exfil, malicious hooks).
 MANIFEST_FILENAMES = {
-    "package.json", "pipfile", "go.mod", "setup.cfg", "setup.py",
+    "package.json", "pipfile", "go.mod", "setup.cfg",
     "pyproject.toml", "cargo.toml", "composer.json", "gemfile",
     "dockerfile", ".gitignore", ".dockerignore",
 }
