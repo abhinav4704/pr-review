@@ -34,6 +34,14 @@ class PullRequest:
     author: str
 
 
+@dataclass
+class Commit:
+    sha: str
+    message: str   # first line, truncated to 80 chars
+    author: str
+    date: str      # YYYY-MM-DD
+
+
 class GitHubClient:
     def __init__(self, token: str) -> None:
         if not token:
@@ -113,6 +121,28 @@ class GitHubClient:
     def get_pr_diff(self, full_name: str, number: int) -> str:
         return self._get(f"{API}/repos/{full_name}/pulls/{number}",
                          headers={"Accept": DIFF_ACCEPT}).text
+
+    def get_commit_diff(self, full_name: str, sha: str) -> str:
+        return self._get(f"{API}/repos/{full_name}/commits/{sha}",
+                         headers={"Accept": DIFF_ACCEPT}).text
+
+    def list_commits(self, full_name: str, branch: str = "",
+                     limit: int = 50) -> List["Commit"]:
+        params: dict = {}
+        if branch:
+            params["sha"] = branch
+        raw = self._paged(f"{API}/repos/{full_name}/commits", limit, params=params)
+        out: List[Commit] = []
+        for c in raw:
+            commit_data = c.get("commit") or {}
+            author_data = commit_data.get("author") or {}
+            out.append(Commit(
+                sha=c.get("sha", ""),
+                message=(commit_data.get("message") or "").splitlines()[0][:80],
+                author=(c.get("author") or {}).get("login") or author_data.get("name") or "?",
+                date=(author_data.get("date") or "")[:10],
+            ))
+        return out
 
     def compare_diff(self, full_name: str, base: str, head: str) -> str:
         return self._get(f"{API}/repos/{full_name}/compare/{base}...{head}",
