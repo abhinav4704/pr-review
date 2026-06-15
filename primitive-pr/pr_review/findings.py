@@ -28,35 +28,31 @@ SEV_BADGE = {
 }
 
 # The output contract we ask every pass to follow.
-FINDINGS_SCHEMA = """This is a PULL REQUEST review. You are shown the CHANGED lines (the
-diff / the lines marked >>>) and the surrounding code/full file as CONTEXT. Only report
-problems that the change INTRODUCES or that the change BREAKS. Use the full code as context
-to judge (e.g. to spot vulnerabilities), but do NOT report pre-existing issues that are
-unrelated to this change. If the change is fine, return [].
+FINDINGS_SCHEMA = """You are reviewing a pull request. You see the CHANGED lines (the diff,
+or the lines marked >>>) plus the surrounding code for context. Only report problems the
+change ADDS or BREAKS. Use the context to judge, but do not report old problems that have
+nothing to do with this change. If the change looks fine, return [].
 
-Return ONLY a JSON array (no prose, no markdown fences). Each element:
+Reply with ONLY a JSON array (no extra text, no markdown). Each item looks like this:
 {
   "kind": "issue" | "suggestion",
   "category": "breaking" | "bug" | "vulnerability" | "optimization" | "suggestion",
   "severity": "critical" | "high" | "medium" | "low" | "info",
   "file": string,            // file path
-  "line": integer,           // most relevant line number (0 if unknown)
+  "line": integer,           // the most relevant line (0 if you are not sure)
   "title": string,           // one short sentence
-  "explanation": string,     // 2-4 sentences: what changed and why it's a problem
-  "evidence": string,        // short code snippet showing the problem
-  "recommendation": string   // concrete actionable fix
+  "explanation": string,     // 2-4 sentences: what is wrong and why it matters
+  "evidence": string,        // a short code snippet showing the problem
+  "recommendation": string   // how to fix it
 }
 
-Categories & severity:
-- breaking   -> the change breaks callers or crashes at runtime. severity: critical.
-- bug        -> the changed logic is wrong / misuses something. severity: critical or high
-                by impact.
-- vulnerability -> something EXPOSED by the change (secret/API key/credential/token) is the
-                worst: severity critical. A security weakness the change leaves unaddressed
-                (SQL injection, unsanitized input, missing auth/validation) is severity high,
-                or medium if lower-risk.
-- optimization -> the change is unoptimized / has a performance problem. severity: medium.
-- suggestion  -> optional improvement. kind "suggestion", severity low.
+How to choose category and severity:
+- breaking: the change breaks callers or crashes at runtime. severity: critical.
+- bug: the new code is wrong or uses something the wrong way. severity: critical or high.
+- vulnerability: the change exposes a secret, key, or token (critical), or leaves a security
+  hole open like SQL injection, unchecked input, or missing auth (high, or medium if low risk).
+- optimization: the change is slow or wasteful. severity: medium.
+- suggestion: a nice-to-have improvement. kind "suggestion", severity low.
 If you find nothing, return []."""
 
 

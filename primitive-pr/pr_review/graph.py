@@ -105,12 +105,16 @@ class _PyExtractor:
     """Walk a Python file with tree-sitter and extract all definitions + relationships."""
 
     def __init__(self, path: str, src: bytes, g: nx.DiGraph,
-                 by_simple: Dict[str, List[str]], module_index: Dict[str, str]) -> None:
+                 by_simple: Dict[str, List[str]], module_index: Dict[str, str],
+                 bindings: Dict[str, str] | None = None) -> None:
         self.path = path
         self.src = src
         self.g = g
         self.by_simple = by_simple
         self.module_index = module_index
+        # local-name -> target file for `from mod import name [as local]`, used to
+        # disambiguate cross-file calls during _resolve.
+        self.bindings = bindings if bindings is not None else {}
         self.is_test = _is_test_path(path)
         self._scope: List[str] = []  # class/function nesting
         self._depends_params: Dict[str, str] = {}  # param_name -> dependency_fn_name
@@ -308,6 +312,25 @@ class _PyExtractor:
                       self.module_index.get(mod_path + "/__init__.py")
                 if tgt:
                     self.g.add_edge(self.path, tgt, type="imports")
+                    # bind each imported symbol to the target file
+                    seen_import_kw = False
+                    for child in node.children:
+                        if child.type == "import":
+                            seen_import_kw = True
+                            continue
+                        if not seen_import_kw:
+                            continue
+                        if child.type in ("dotted_name", "identifier"):
+                            nm = _text(child).split(".")[0]
+                            if nm:
+                                self.bindings[nm] = tgt
+                        elif child.type == "aliased_import":
+                            alias = child.child_by_field_name("alias")
+                            name = child.child_by_field_name("name")
+                            local = _text(alias) if alias else (_text(name) if name else "")
+                            local = local.split(".")[0]
+                            if local:
+                                self.bindings[local] = tgt
 
     def _handle_call(self, node) -> None:
         pass  # handled in _extract_calls_in_body
@@ -525,8 +548,40 @@ class CodeGraph:
 
 
 # ── resolve unresolved edges ───────────────────────────────────────────────────
-def _resolve(g: nx.DiGraph, by_simple: Dict[str, List[str]]) -> None:
-    """Replace __unresolved__ placeholder targets with real node ids."""
+def _class_of(node_id: str) -> str:
+    """The immediate enclosing class name of a method node, or '' for a function.
+
+    e.g. 'models.py::User.save' -> 'User'; 'a.py::Outer.Inner.m' -> 'Inner'.
+    """
+    qual = node_id.split("::", 1)[1] if "::" in node_id else node_id
+    if "." not in qual:
+        return ""
+    return qual.rsplit(".", 1)[0].rsplit(".", 1)[-1]
+
+
+def _resolve(g: nx.DiGraph, by_simple: Dict[str, List[str]],
+             import_bindings: Dict[str, Dict[str, str]] | None = None) -> None:
+    """Replace __unresolved__ placeholder targets with real node ids.
+
+    Each resolved edge is tagged with a `confidence`, so downstream impact
+    analysis can tell a sure link from a guessed one:
+        "unique"    exactly one candidate, OR a same-file / imported binding
+                    pins it to a single definition.
+        "same_file" several candidates but one (or more) live in the caller's
+                    file (or its `from x import` target) — preferred.
+        "ambiguous" no same-file / imported match and several same-named
+                    definitions exist; the edge is a guess fanned out to all.
+    `candidates` stores how many definitions matched the simple name.
+    """
+    import_bindings = import_bindings or {}
+
+    # pre-pass: which classes does each caller instantiate? (e.g. `u = User()`)
+    # lets us resolve `u.save()` to User.save when several classes define save().
+    instantiated: Dict[str, Set[str]] = {}
+    for u, v, data in g.edges(data=True):
+        if str(v).startswith("__unresolved__::") and data.get("type") == "instantiates":
+            instantiated.setdefault(u, set()).add(v.split("::", 1)[1])
+
     to_remove: List[tuple] = []
     to_add: List[tuple] = []
 
@@ -539,12 +594,37 @@ def _resolve(g: nx.DiGraph, by_simple: Dict[str, List[str]]) -> None:
         if not candidates:
             continue
         caller_file = u.split("::", 1)[0]
-        # prefer same-file candidates
+        # 1. prefer same-file candidates (a local def shadows an import)
         same_file = [c for c in candidates if c.split("::", 1)[0] == caller_file]
-        chosen = same_file or candidates
+        if same_file:
+            chosen = same_file
+            confidence = "same_file" if len(candidates) > 1 else "unique"
+        else:
+            # 2. use `from mod import name` bindings to pin the right file
+            tgt_file = import_bindings.get(caller_file, {}).get(name)
+            imported = ([c for c in candidates if c.split("::", 1)[0] == tgt_file]
+                        if tgt_file else [])
+            # 3. for a method call, prefer the class the caller instantiates
+            by_inst = []
+            if not imported and data.get("type") == "calls" and len(candidates) > 1:
+                caller_classes = instantiated.get(u, set())
+                by_inst = [c for c in candidates if _class_of(c) in caller_classes]
+            if imported:
+                chosen = imported
+                confidence = "unique" if len(imported) == 1 else "same_file"
+            elif by_inst:
+                chosen = by_inst
+                confidence = "unique" if len(by_inst) == 1 else "same_file"
+            else:
+                # 4. fall back: guess (and fan out to) all same-named defs
+                chosen = candidates
+                confidence = "ambiguous" if len(candidates) > 1 else "unique"
         for tgt in chosen:
             if tgt != u:
-                to_add.append((u, tgt, data))
+                edge_data = dict(data)
+                edge_data["confidence"] = confidence
+                edge_data["candidates"] = len(candidates)
+                to_add.append((u, tgt, edge_data))
 
     for edge in to_remove:
         g.remove_edge(*edge)
@@ -617,6 +697,10 @@ def build_graph(root: str, max_files: int = 5000) -> CodeGraph:
             if mod.endswith(".__init__"):
                 module_index[mod[: -len(".__init__")]] = path
 
+    # per-file imported-symbol bindings (local_name -> target file), filled by the
+    # extractors and used by _resolve to disambiguate cross-file calls.
+    import_bindings: Dict[str, Dict[str, str]] = {}
+
     # add file nodes + extract definitions
     for path, lang in source_files:
         full = os.path.join(root, path)
@@ -641,7 +725,9 @@ def build_graph(root: str, max_files: int = 5000) -> CodeGraph:
                 parser = Parser(ts_lang)
                 tree = parser.parse(src_bytes)
                 if lang == "python":
-                    ext = _PyExtractor(path, src_bytes, g, cg._by_simple, module_index)
+                    bindings = import_bindings.setdefault(path, {})
+                    ext = _PyExtractor(path, src_bytes, g, cg._by_simple,
+                                       module_index, bindings)
                     ext.extract(tree.root_node)
                 else:
                     ext2 = _GenericExtractor(path, lang, src_bytes, g, cg._by_simple)
@@ -649,11 +735,13 @@ def build_graph(root: str, max_files: int = 5000) -> CodeGraph:
             except Exception:
                 # fall back to ast for Python if tree-sitter parse fails
                 if lang == "python":
-                    _ast_fallback(path, src_text, g, cg._by_simple, module_index)
+                    _ast_fallback(path, src_text, g, cg._by_simple, module_index,
+                                  import_bindings.setdefault(path, {}))
         elif lang == "python":
-            _ast_fallback(path, src_text, g, cg._by_simple, module_index)
+            _ast_fallback(path, src_text, g, cg._by_simple, module_index,
+                          import_bindings.setdefault(path, {}))
 
-    _resolve(g, cg._by_simple)
+    _resolve(g, cg._by_simple, import_bindings)
     _resolve_overrides(g)
     return cg
 
@@ -661,8 +749,10 @@ def build_graph(root: str, max_files: int = 5000) -> CodeGraph:
 # ── ast fallback for Python ────────────────────────────────────────────────────
 def _ast_fallback(path: str, src: str, g: nx.DiGraph,
                   by_simple: Dict[str, List[str]],
-                  module_index: Dict[str, str]) -> None:
+                  module_index: Dict[str, str],
+                  bindings: Dict[str, str] | None = None) -> None:
     """Pure-ast Python extraction (used when tree-sitter is unavailable)."""
+    bindings = bindings if bindings is not None else {}
     try:
         tree = pyast.parse(src, filename=path)
     except SyntaxError:
@@ -732,6 +822,10 @@ def _ast_fallback(path: str, src: str, g: nx.DiGraph,
                 tgt = module_index.get(node.module)
                 if tgt:
                     g.add_edge(path, tgt, type="imports")
+                    for alias in node.names:
+                        local = alias.asname or alias.name
+                        if local and local != "*":
+                            bindings[local] = tgt
 
     for n in tree.body:
         visit(n)

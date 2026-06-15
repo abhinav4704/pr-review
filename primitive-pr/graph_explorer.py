@@ -45,11 +45,15 @@ ss.setdefault("user", None)
 ss.setdefault("repos", [])
 ss.setdefault("graph_ref", None)
 ss.setdefault("src_path", None)
+ss.setdefault("cg", None)
 ss.setdefault("graph_stats", None)
 ss.setdefault("diff_files", None)
 ss.setdefault("diff_raw", None)
 ss.setdefault("diff_pr_number", None)
 ss.setdefault("pr_review_results", None)
+ss.setdefault("impact_reviews", None)
+ss.setdefault("impact_depth", 3)
+ss.setdefault("impact_verify", True)
 ss.setdefault("arch_digest_md", None)
 ss.setdefault("arch_review_md", None)
 ss.setdefault("provider_key", "nova")
@@ -378,6 +382,88 @@ def render_report() -> None:
                        file_name="pr_review_report.md")
 
 
+def _role_badge(node) -> str:
+    if node.changed:
+        return "🟥"          # the changed source/intermediate
+    if node.role == "consumer":
+        if node.kind in ("route", "event"):
+            return "🟪"      # unchanged entrypoint consumer
+        if node.is_test:
+            return "🧪"
+        return "🟦"          # unchanged consumer (breakage candidate)
+    return "⬜"
+
+
+def _chain_md(chain) -> str:
+    """Render one chain as 'source → … → consumer' with role badges + locations."""
+    hops = []
+    for n in chain.nodes:
+        loc = f"`{n.path}:{n.start_line}`" if n.path else ""
+        tag = ""
+        if n.changed:
+            tag = f" _(changed: {n.change_type})_"
+        elif n.modified_in_pr:
+            tag = " _(also touched)_"
+        elif n.role == "consumer":
+            tag = " _(unchanged)_"
+        hops.append(f"{_role_badge(n)} **{n.qualname}** {loc}{tag}")
+    line = "  →  ".join(hops)
+    if chain.uncertain:
+        line += "  · _uncertain link_"
+    if chain.field_hits:
+        line += f"  \n  &nbsp;&nbsp;⚠ _still uses removed/renamed field(s):_ " \
+                f"`{', '.join(chain.field_hits)}`"
+    return line
+
+
+def render_impact_chains() -> None:
+    from pr_review.findings import SEV_BADGE
+    reviews = ss.impact_reviews
+    if not reviews:
+        st.info("No impact chains: the changed code has no unchanged consumers "
+                "(callers) in the graph, or nothing in the diff mapped to a graph node.")
+        return
+
+    st.caption(
+        "Each cluster groups co-changed functions; chains trace the change out to the "
+        "first **unchanged** consumer it may break. 🟥 changed · 🟦 unchanged consumer · "
+        "🟪 entrypoint · 🧪 test")
+
+    from pr_review.impact import cluster_risk
+    for idx, rev in enumerate(reviews):
+        cluster, findings = rev.cluster, rev.findings
+        members = ", ".join(ss.cg.node(m).get("qualname", m) for m in cluster.members
+                            if ss.cg.has(m))
+        n_break = sum(1 for f in findings if f.category == "breaking")
+        # risk: deterministic signal, bumped to high if the LLM confirmed a break
+        risk_label, risk_emoji = cluster_risk(cluster)
+        if n_break:
+            risk_label, risk_emoji = "high", "🔴"
+        title = (f"{risk_emoji} [{risk_label.upper()}] {members} — "
+                 f"{len(cluster.chains)} consumer(s)"
+                 f"{f', {n_break} breaking' if n_break else ''}")
+        with st.expander(title, expanded=bool(n_break)):
+            st.markdown("**Propagation chains**")
+            for ch in cluster.chains:
+                st.markdown("- " + _chain_md(ch))
+            if cluster.extra_consumers:
+                st.caption(f"+{cluster.extra_consumers} more consumer(s) not shown")
+
+            st.markdown("**LLM verdict**")
+            if not findings:
+                st.caption("No breakage found by the model for these chains.")
+            for f in findings:
+                st.markdown(f"{SEV_BADGE.get(f.severity, '')} **[{f.severity.upper()}] "
+                            f"{f.title}**  \n_`{f.file}:{f.line}` · {f.category}_")
+                if f.explanation:
+                    st.write(f.explanation)
+                if f.evidence:
+                    st.code(f.evidence)
+                if f.recommendation:
+                    st.markdown(f"**Fix:** {f.recommendation}")
+                st.divider()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
@@ -443,11 +529,15 @@ pr = pr_labels[st.selectbox("Pull request", list(pr_labels.keys()))]
 col_a, col_b = st.columns([1, 3])
 analyze = col_a.button("Analyze PR", type="primary", use_container_width=True)
 rebuild = col_b.checkbox("Rebuild graph (ignore cache)", value=False)
-include_dependees = col_b.checkbox(
-    "Also check dependee functions (callees)", value=False,
-    help="By default only dependent functions (callers of the changed code) are reviewed "
-         "for breaking changes. Enable this to also pull in the functions the changed code "
-         "calls (dependees) and check it uses them correctly.")
+ss.impact_depth = col_b.slider(
+    "Impact depth (max hops a change is traced)", 1, 5, ss.impact_depth,
+    help="How many call-graph hops to follow from the changed code out to the unchanged "
+         "consumers it may break. Each chain stops at the first unchanged consumer; this caps "
+         "how far through changed intermediates we walk to reach it.")
+ss.impact_verify = col_b.checkbox(
+    "Verify findings (extra precision pass)", value=ss.impact_verify,
+    help="Run a second, strict LLM pass that drops impact findings not grounded in a specific "
+         "consumer line. Fewer false positives, one extra call per cluster with findings.")
 
 if analyze:
     store = get_store()
@@ -458,7 +548,8 @@ if analyze:
         with st.status("Analyzing PR…", expanded=True) as status:
             try:
                 # 1. graph (cached per PR head unless rebuild)
-                if rebuild or ss.graph_ref != pr.head_ref or not ss.src_path:
+                if rebuild or ss.graph_ref != pr.head_ref or not ss.src_path \
+                        or ss.cg is None:
                     from pr_review.graph import build_graph
                     status.write(f"Downloading `{repo}` at head `{pr.head_ref}`…")
                     src = ss.gh.download_source(pr.head_repo, pr.head_ref)
@@ -468,6 +559,7 @@ if analyze:
                     store.push(cg, pr_ref=pr.head_ref)
                     ss.graph_ref = pr.head_ref
                     ss.src_path = src
+                    ss.cg = cg          # kept in-memory for impact-chain analysis
                     ss.graph_stats = (cg.g.number_of_nodes(), cg.g.number_of_edges())
                 else:
                     status.write("Using cached graph.")
@@ -479,9 +571,9 @@ if analyze:
                 ss.diff_files = parse_diff_files(raw)
                 ss.diff_pr_number = pr.number
 
-                # 3. multi-pass review
+                # 3. review — track A (per-file) + track B (impact chains)
                 from pr_review.diff import parse_diff
-                from pr_review.pr_passes import review_pr
+                from pr_review.pr_passes import review_pr, review_pr_impact
                 from pr_review.review_llm import make_completion_fn
 
                 complete_fn = make_completion_fn(ss.provider_key, **ss.llm_creds)
@@ -493,9 +585,20 @@ if analyze:
                         status.write(f"Reviewing file {i + 1}/{total}: `{path}`")
 
                 ss.pr_review_results = review_pr(
-                    store, ss.src_path, ss.graph_ref, file_diffs,
-                    complete_fn, budget=ss.budget, progress_cb=_cb,
-                    include_dependees=include_dependees, diff_by_file=diff_by_file)
+                    ss.src_path, file_diffs, complete_fn, budget=ss.budget,
+                    progress_cb=_cb, diff_by_file=diff_by_file)
+
+                def _cb_impact(i, total, name):
+                    if total and i < total:
+                        status.write(f"Tracing impact {i + 1}/{total}"
+                                     + (f": `{name}`" if name else ""))
+
+                status.write("Tracing impact chains…")
+                ss.impact_reviews = review_pr_impact(
+                    ss.cg, ss.src_path, file_diffs, complete_fn,
+                    budget=ss.budget, max_depth=ss.impact_depth,
+                    diff_by_file=diff_by_file, verify=ss.impact_verify,
+                    progress_cb=_cb_impact)
                 status.update(label="Analysis complete ✓", state="complete", expanded=False)
             except Exception as e:
                 status.update(label="Analysis failed", state="error")
@@ -509,6 +612,12 @@ if ss.graph_stats:
     m1.metric("Graph nodes", n)
     m2.metric("Graph edges", e)
     m3.metric("Files changed", len(ss.diff_files or []))
+
+# ── Impact chains (primary) ──────────────────────────────────────────────────
+if ss.impact_reviews is not None:
+    st.divider()
+    st.subheader("🌊 Impact chains — what this change breaks")
+    render_impact_chains()
 
 # ── Report (headline) ────────────────────────────────────────────────────────
 if ss.pr_review_results:
