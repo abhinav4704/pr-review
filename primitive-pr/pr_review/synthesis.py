@@ -48,6 +48,8 @@ Each item follows this schema exactly:
 }
 
 Rules:
+- Use "critical" only when your confidence is "high" — a critical you are unsure about
+  will be trimmed to high. Confident criticals of any kind are kept.
 - Merge overlapping findings and chains into a single issue — do NOT list them separately.
 - If findings reference the same root cause, produce ONE issue, not N.
 - If there is truly more than one independent issue, produce separate objects.
@@ -242,25 +244,41 @@ def _finding_to_compact(f: Finding) -> dict:
 
 
 def _build_synthesis_dossier(cg, cluster_review: ClusterReview,
-                              matched_findings: List[Finding]) -> str:
+                              matched_findings: List[Finding],
+                              diff_by_file: Optional[Dict[str, str]] = None) -> str:
     """Build the compact dossier sent to the Synthesizer LLM.
 
     Intentionally does NOT re-send full consumer source (already consumed by
-    Track B). Only sends: changed node identities, Track A JSON, chain text.
+    Track B). Only sends: changed node identities, Track A JSON, chain text, and —
+    when ``diff_by_file`` is supplied — the actual diff of the changed files so the
+    synthesizer can see exactly which lines changed.
     """
     cluster = cluster_review.cluster
     parts: List[str] = ["# Synthesis input for a cluster of co-changed code\n"]
 
     # 1. Changed node identities (names + files + lines)
     parts.append("## Changed code locations\n")
+    cluster_files: List[str] = []
     for nid in cluster.members:
         if not cg.has(nid):
             continue
         d = cg.node(nid)
+        path = d.get("path", "?")
+        if path not in cluster_files:
+            cluster_files.append(path)
         parts.append(
             f"- **{d.get('kind', '?')} `{d.get('qualname') or d.get('name')}`** "
-            f"in `{d.get('path', '?')}` lines {d.get('start_line')}–{d.get('end_line')}\n"
+            f"in `{path}` lines {d.get('start_line')}–{d.get('end_line')}\n"
         )
+
+    # 1b. The actual changed lines (diff), so Track C knows what changed.
+    if diff_by_file:
+        diff_blocks = [(p, diff_by_file[p]) for p in cluster_files
+                       if diff_by_file.get(p, "").strip()]
+        if diff_blocks:
+            parts.append("\n## What changed (diff of the changed files)\n")
+            for p, diff_text in diff_blocks:
+                parts.append(f"`{p}`\n```diff\n{diff_text}\n```\n")
 
     # 2. Track A findings (local — in the changed files)
     parts.append("\n## Local findings (Track A — from direct file review)\n")
@@ -313,6 +331,7 @@ def synthesize_cluster(
     complete: CompleteFn,
     budget: int = DEFAULT_BUDGET,
     cluster_idx: int = 0,
+    diff_by_file: Optional[Dict[str, str]] = None,
 ) -> List[IssueReport]:
     """Run the Synthesizer LLM for one cluster.
 
@@ -325,7 +344,7 @@ def synthesize_cluster(
     if not matched and not cluster_review.findings and not cluster.chains:
         return []
 
-    dossier = _build_synthesis_dossier(cg, cluster_review, matched)
+    dossier = _build_synthesis_dossier(cg, cluster_review, matched, diff_by_file)
 
     # Trim to budget (keep the synthesis input whole — no chunking; the dossier
     # is already much smaller than the full cluster dossier in pr_passes)
@@ -347,6 +366,16 @@ def synthesize_cluster(
 
 def _severity_key(r: IssueReport) -> int:
     return SEVERITY_ORDER.get(r.severity, 99)
+
+
+def finalize_report_severity(r: IssueReport) -> None:
+    """Light guard on a synthesized issue's "critical": keep it unless low-confidence.
+
+    The synthesizer's severity is trusted; the only trim is a "critical" the model is
+    not highly confident about, which drops to high. Never upgrades.
+    """
+    if r.severity == "critical" and r.confidence != "high":
+        r.severity = "high"
 
 
 def _dedupe_reports(reports: List[IssueReport]) -> List[IssueReport]:
@@ -438,10 +467,14 @@ def synthesize_all(
     budget: int = DEFAULT_BUDGET,
     max_workers: int = 4,
     progress_cb=None,
+    diff_by_file: Optional[Dict[str, str]] = None,
 ) -> List[IssueReport]:
     """Synthesize all clusters concurrently; return deduplicated IssueReports sorted by severity.
 
     Mirrors the ThreadPoolExecutor pattern of review_pr_impact().
+
+    ``diff_by_file`` (optional) lets each cluster's dossier include the actual diff of
+    its changed files, so Track C sees which lines changed.
     """
     total = len(cluster_reviews)
     if not total:
@@ -453,7 +486,8 @@ def synthesize_all(
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {
             ex.submit(
-                synthesize_cluster, cg, cr, track_a_results, complete, budget, idx
+                synthesize_cluster, cg, cr, track_a_results, complete, budget, idx,
+                diff_by_file
             ): idx
             for idx, cr in enumerate(cluster_reviews)
         }
@@ -482,4 +516,7 @@ def synthesize_all(
     for cr in cluster_reviews:
         all_inputs.extend(cr.findings)
         all_inputs.extend(_findings_for_cluster(cg, cr.cluster, track_a_results))
-    return _with_no_loss_accounting(deduped, all_inputs)
+    reports = _with_no_loss_accounting(deduped, all_inputs)
+    for r in reports:
+        finalize_report_severity(r)
+    return sorted(reports, key=_severity_key)

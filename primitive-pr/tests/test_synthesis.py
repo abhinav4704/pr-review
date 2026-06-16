@@ -255,7 +255,7 @@ def test_synthesize_all_concurrent_returns_sorted_by_severity():
                                 findings=[_make_finding(severity="medium", file="a.py", line=5)])
     cr2 = _make_cluster_review(members=("n2",),
                                 findings=[_make_finding(severity="critical", file="b.py", line=5,
-                                                        title="RCE found")])
+                                                        title="RCE found", category="breaking")])
 
     def make_llm(severity, title):
         payload = [{
