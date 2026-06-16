@@ -217,6 +217,47 @@ def _added_lines_for(file_diffs, path: str):
     return set()
 
 
+def _caller_function_blocks(cg, src_path: str, target_node_id: str,
+                            max_callers: int = 5) -> List[str]:
+    """Render inbound caller evidence as full caller function code blocks."""
+    rows = cg.caller_evidence_lines(
+        target_node_id,
+        relations={"calls", "instantiates", "imports", "references", "uses"},
+        include_ambiguous=False,
+    )
+
+    blocks: List[str] = []
+    seen: set = set()
+    for row in rows:
+        caller_id = str(row.get("caller_id") or "")
+        if not caller_id or caller_id in seen or not cg.has(caller_id):
+            continue
+        seen.add(caller_id)
+
+        d = cg.node(caller_id)
+        path = str(d.get("path") or "")
+        start = int(d.get("start_line") or 0)
+        end = int(d.get("end_line") or 0)
+        if not path or start <= 0 or end < start:
+            continue
+
+        src = read_source(src_path, path, start, end)
+        if not src.strip():
+            continue
+
+        label = d.get("qualname") or d.get("name") or caller_id
+        relation = str(row.get("relation") or "")
+        numbered = number_lines(src, start)
+        blocks.append(
+            f"   - {d.get('kind','?')} {label} ({path}, lines {start}-{end}) [{relation}]\n"
+            f"```\n{numbered}\n```\n"
+        )
+        if len(blocks) >= max_callers:
+            break
+
+    return blocks
+
+
 def _cluster_dossier(cg, src_path: str, cluster: Cluster, file_diffs,
                      diff_by_file: Dict[str, str]) -> str:
     """Changed source(s) + old→new contract + chains + unchanged-consumer source."""
@@ -247,6 +288,10 @@ def _cluster_dossier(cg, src_path: str, cluster: Cluster, file_diffs,
         maybe = "   (uncertain link — confirm the consumer really calls into this)" \
             if ch.uncertain else ""
         parts.append(f"{i}. {chain_to_text(ch)}{flag}{maybe}\n")
+        caller_blocks = _caller_function_blocks(cg, src_path, ch.source.node_id)
+        if caller_blocks:
+            parts.append("   caller evidence (full caller functions):\n")
+            parts.extend(caller_blocks)
     if cluster.extra_consumers or len(cluster.chains) > len(shown):
         more = cluster.extra_consumers + (len(cluster.chains) - len(shown))
         parts.append(f"_(+{more} more consumer(s) not shown)_\n")

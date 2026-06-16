@@ -33,6 +33,13 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import networkx as nx
 
 from .diff import ChangedNode, FileDiff, map_changes, node_was_modified
+from .graph_contract import (
+    confidence_score,
+    edge_relation,
+    is_ambiguous_confidence,
+    is_same_file_confidence,
+    relation_weight,
+)
 from .graph import CodeGraph
 
 # Edges that mean "X depends on Y" — followed in REVERSE (in-edges) to find who
@@ -42,7 +49,19 @@ from .graph import CodeGraph
 #   instantiates constructor -> class
 #   overrides    subclass-m  -> parent-method   (parent changes -> override affected)
 #   inherits     subclass    -> parent-class    (parent changes -> subclass affected)
-IMPACT_EDGE_TYPES = {"calls", "instantiates", "overrides", "inherits"}
+IMPACT_EDGE_TYPES = {
+    "calls",
+    "instantiates",
+    "overrides",
+    "inherits",
+    "imports",
+    "references",
+    "uses",
+    "implements",
+    "extends",
+    "re_exports",
+    "decorates",
+}
 
 # Edges used to group co-changed functions into one cluster (either direction).
 CLUSTER_EDGE_TYPES = {"calls", "instantiates", "overrides", "inherits"}
@@ -129,7 +148,8 @@ def build_change_clusters(cg: CodeGraph, changed: Set[str]) -> List[List[str]]:
     changed = {c for c in changed if cg.has(c)}
     u = nx.Graph()
     u.add_nodes_from(changed)
-    for a, b, t in cg.g.edges(data="type"):
+    for a, b, data in cg.g.edges(data=True):
+        t = edge_relation(data)
         if t in CLUSTER_EDGE_TYPES and a in changed and b in changed:
             u.add_edge(a, b)
     return [sorted(comp) for comp in nx.connected_components(u)]
@@ -145,13 +165,22 @@ def _impactors(cg: CodeGraph, nid: str,
     """
     out: List[Tuple[str, str, str]] = []
     for dep, _, data in cg.g.in_edges(nid, data=True):
-        t = data.get("type")
+        t = edge_relation(data)
         if t not in IMPACT_EDGE_TYPES:
             continue
         conf = data.get("confidence", "unique")
-        if exclude_ambiguous and conf == "ambiguous":
+        if exclude_ambiguous and is_ambiguous_confidence(conf):
             continue
         out.append((dep, t, conf))
+    # Deterministic, quality-first ordering: higher confidence + stronger
+    # relations first, then stable node-id tie-break.
+    out.sort(
+        key=lambda x: (
+            -confidence_score(x[2]),
+            -relation_weight(x[1]),
+            str(x[0]),
+        )
+    )
     return out
 
 
@@ -272,7 +301,7 @@ def _origin_prefix(cg: CodeGraph, start: str, cluster_set: Set[str],
         extended = False
         if len(path) < max_len:
             for _, tgt, data in cg.g.out_edges(node, data=True):
-                if data.get("type") not in ("calls", "instantiates"):
+                if edge_relation(data) not in ("calls", "instantiates"):
                     continue
                 if tgt in cluster_set and tgt not in visited:
                     extended = True
@@ -328,13 +357,13 @@ def _build_chain(cg: CodeGraph, consumer: str,
                     et, cf = "", ""
                 else:
                     ed = cg.g.get_edge_data(oid, origin_ids[i - 1]) or {}
-                    et, cf = ed.get("type", ""), ed.get("confidence", "")
+                    et, cf = edge_relation(ed), ed.get("confidence", "")
                 prefix.append(_chain_node(
                     cg, oid, "source" if i == 0 else "intermediate", changed, ctype,
                     node_was_modified(file_diffs, cg, oid), et, cf))
             # link the (former) source to the nearest origin behind it
             ed = cg.g.get_edge_data(origin_ids[-1], origin_ids[-2]) or {}
-            nodes[0].edge_type = ed.get("type", "")
+            nodes[0].edge_type = edge_relation(ed)
             nodes[0].edge_confidence = ed.get("confidence", "")
             nodes[0].role = "intermediate"
             nodes = prefix + nodes
@@ -348,7 +377,7 @@ def _build_chain(cg: CodeGraph, consumer: str,
         via_tests=consumer_node.is_test,
         modified_consumer=consumer_node.modified_in_pr,
     )
-    chain.uncertain = any(n.edge_confidence == "ambiguous" for n in nodes)
+    chain.uncertain = any(is_ambiguous_confidence(n.edge_confidence) for n in nodes)
     # data-flow: does this consumer still reference a removed/renamed field?
     if gone and consumer_src_fn:
         src = consumer_src_fn(consumer_node)
@@ -370,8 +399,13 @@ def _score_chain(chain: Chain) -> float:
         score += 3.0
     # closer consumers are more directly impacted / higher confidence
     score += max(0.0, (4 - chain.distance)) * 0.5
+    # Reward strong, deterministic path hops over weak structural hops.
+    hop_bonus = 0.0
+    for node in chain.nodes[1:]:
+        hop_bonus += relation_weight(node.edge_type) * confidence_score(node.edge_confidence)
+    score += min(hop_bonus, 3.0)
     # a same-file-resolved hop is slightly less certain than a unique one
-    if any(n.edge_confidence == "same_file" for n in chain.nodes):
+    if any(is_same_file_confidence(n.edge_confidence) for n in chain.nodes):
         score -= 0.3
     if chain.via_tests:
         score -= 2.0          # a test catching the change is good news, not a break

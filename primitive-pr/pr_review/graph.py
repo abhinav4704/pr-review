@@ -27,9 +27,28 @@ from __future__ import annotations
 import ast as pyast
 import os
 from dataclasses import dataclass, field
+from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
 
 import networkx as nx
+
+from .graph_contract import confidence_score, edge_relation, normalize_confidence
+from .graphify_adapter import try_build_with_graphify
+
+
+DEFAULT_IMPACT_RELATIONS = {
+    "calls",
+    "instantiates",
+    "overrides",
+    "inherits",
+    "imports",
+    "references",
+    "uses",
+    "implements",
+    "extends",
+    "re_exports",
+    "decorates",
+}
 
 # ── tree-sitter language loading ──────────────────────────────────────────────
 def _load_languages() -> Dict[str, object]:
@@ -89,6 +108,20 @@ def _is_test_path(path: str) -> bool:
         or os.path.basename(p).endswith("_test.py")
         or "/tests/" in p or "/test/" in p or "/spec/" in p
     )
+
+
+def _line_from_source_location(value: object) -> int:
+    """Extract the first line number from source_location values like L12-L18."""
+    if value is None:
+        return 0
+    s = str(value)
+    digits = ""
+    for ch in s:
+        if ch.isdigit():
+            digits += ch
+        elif digits:
+            break
+    return int(digits) if digits else 0
 
 
 def _text(node) -> str:
@@ -517,6 +550,89 @@ class CodeGraph:
     def fan_in(self, nid: str) -> int:
         return len(self.callers(nid))
 
+    def reverse_dependents(self, nid: str, depth: int = 2,
+                           relations: Optional[Set[str]] = None,
+                           exclude_ambiguous: bool = False) -> Dict[str, int]:
+        """Return reverse dependency frontier with hop distance.
+
+        Walks incoming edges whose canonical relation belongs to relations.
+        """
+        relation_set = relations or DEFAULT_IMPACT_RELATIONS
+        seen: Dict[str, int] = {}
+        queue: deque[Tuple[str, int]] = deque([(nid, 0)])
+        visited = {nid}
+
+        while queue:
+            current, d = queue.popleft()
+            if d >= depth:
+                continue
+            for src, _tgt, data in self.g.in_edges(current, data=True):
+                relation = edge_relation(data)
+                if relation not in relation_set:
+                    continue
+                if exclude_ambiguous and str(data.get("confidence", "")).lower() == "ambiguous":
+                    continue
+                if src in visited:
+                    continue
+                visited.add(src)
+                next_depth = d + 1
+                seen[src] = next_depth
+                queue.append((src, next_depth))
+
+        return seen
+
+    def caller_evidence_lines(self, nid: str,
+                              relations: Optional[Set[str]] = None,
+                              include_ambiguous: bool = False) -> List[dict]:
+        """Return one-line caller evidence entries for inbound dependencies.
+
+        Each entry includes caller id, relation, source file, line number and
+        the exact one-line code snippet when available.
+        """
+        relation_set = relations or DEFAULT_IMPACT_RELATIONS
+        out: List[dict] = []
+        for caller, _target, data in self.g.in_edges(nid, data=True):
+            relation = edge_relation(data)
+            if relation not in relation_set:
+                continue
+            conf = str(data.get("confidence", ""))
+            if not include_ambiguous and conf.lower() == "ambiguous":
+                continue
+
+            caller_node = self.g.nodes.get(caller, {})
+            path = str(
+                data.get("source_file")
+                or caller_node.get("source_file")
+                or caller_node.get("path")
+                or ""
+            )
+            line = _line_from_source_location(data.get("source_location"))
+            if not line:
+                line = int(caller_node.get("start_line") or 0)
+
+            code_line = ""
+            if path and line > 0:
+                full = os.path.join(self.root, path)
+                try:
+                    with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                        lines = fh.readlines()
+                    if 1 <= line <= len(lines):
+                        code_line = lines[line - 1].rstrip("\n")
+                except OSError:
+                    code_line = ""
+
+            out.append({
+                "caller_id": caller,
+                "relation": relation,
+                "confidence": conf,
+                "file": path,
+                "line": line,
+                "code_line": code_line,
+            })
+
+        out.sort(key=lambda x: (x["file"], x["line"], x["caller_id"]))
+        return out
+
     def routes(self) -> List[str]:
         return [n for n, d in self.g.nodes(data=True) if d.get("kind") == "route"]
 
@@ -665,10 +781,38 @@ def _resolve_overrides(g: nx.DiGraph) -> None:
                     g.add_edge(child_m, parent_methods[mname], type="overrides")
 
 
+def _sync_edge_contract(g: nx.DiGraph) -> None:
+    """Populate canonical edge fields without breaking legacy callers."""
+    for _u, _v, data in g.edges(data=True):
+        relation = edge_relation(data)
+        if relation:
+            data.setdefault("relation", relation)
+            data.setdefault("type", relation)
+        legacy_conf = data.get("confidence", "unique")
+        data.setdefault("confidence_kind", normalize_confidence(legacy_conf))
+        data.setdefault("confidence_score", confidence_score(legacy_conf))
+
+
 # ── build_graph ────────────────────────────────────────────────────────────────
-def build_graph(root: str, max_files: int = 5000) -> CodeGraph:
+def build_graph(root: str, max_files: int = 5000, backend: str = "primitive") -> CodeGraph:
     cg = CodeGraph(root=os.path.abspath(root))
     g = cg.g
+
+    if backend == "vendored":
+        backend = "graphify"
+
+    if backend in {"graphify", "auto"}:
+        adapted = try_build_with_graphify(root, max_files=max_files)
+        if adapted is not None:
+            graph, lang_counts, by_simple = adapted
+            cg.g = graph
+            cg.lang_counts = lang_counts
+            cg._by_simple = by_simple
+            return cg
+        if backend == "graphify":
+            raise RuntimeError(
+                "Graphify backend requested but graphify package is unavailable."
+            )
 
     # collect all supported source files
     source_files: List[Tuple[str, str]] = []  # (rel_path, lang)
@@ -743,6 +887,7 @@ def build_graph(root: str, max_files: int = 5000) -> CodeGraph:
 
     _resolve(g, cg._by_simple, import_bindings)
     _resolve_overrides(g)
+    _sync_edge_contract(g)
     return cg
 
 

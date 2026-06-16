@@ -24,17 +24,37 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional
 
+from .graph_contract import edge_relation
 from .graph import CodeGraph
 
 _EDGE_REL = {
     "calls": "CALLS",
     "imports": "IMPORTS",
+    "references": "REFERENCES",
     "defines": "DEFINES",
     "inherits": "INHERITS",
     "overrides": "OVERRIDES",
     "decorates": "DECORATES",
     "instantiates": "INSTANTIATES",
+    "implements": "IMPLEMENTS",
+    "extends": "EXTENDS",
+    "uses": "USES",
+    "re_exports": "RE_EXPORTS",
 }
+
+DEFAULT_IMPACT_RELATIONS = [
+    "CALLS",
+    "INSTANTIATES",
+    "OVERRIDES",
+    "INHERITS",
+    "IMPORTS",
+    "REFERENCES",
+    "USES",
+    "IMPLEMENTS",
+    "EXTENDS",
+    "RE_EXPORTS",
+    "DECORATES",
+]
 
 
 class Neo4jStore:
@@ -101,7 +121,7 @@ class Neo4jStore:
         # edges grouped by type
         edges_by_type: Dict[str, List[Dict]] = {}
         for u, v, data in cg.g.edges(data=True):
-            etype = data.get("type", "calls")
+            etype = edge_relation(data, "calls")
             rel = _EDGE_REL.get(etype, "CALLS")
             edges_by_type.setdefault(rel, []).append({"from": u, "to": v})
 
@@ -137,6 +157,30 @@ class Neo4jStore:
             {"id": node_id},
         )
         return [r["id"] for r in rows]
+
+    def reverse_dependents(self, node_id: str, depth: int = 2,
+                           relations: Optional[List[str]] = None) -> List[Dict]:
+        """General reverse dependency traversal for PR and repo analysis.
+
+        Returns distinct dependent nodes that reach node_id via allowed relation
+        types, up to depth hops.
+        """
+        if not self._available:
+            return []
+        rels = relations or DEFAULT_IMPACT_RELATIONS
+        safe_rels = [r for r in rels if r in set(_EDGE_REL.values())]
+        if not safe_rels:
+            return []
+        depth = max(1, min(int(depth), 6))
+        rows = self._run(
+            "MATCH p=(dep:Node)-[r*1.." + str(depth) + "]->(n:Node {id: $id}) "
+            "WHERE ALL(rel IN r WHERE type(rel) IN $rels) "
+            "RETURN DISTINCT dep.id AS id, dep.kind AS kind, dep.name AS name, "
+            "dep.qualname AS qualname, dep.path AS path "
+            "ORDER BY coalesce(dep.qualname, dep.path, dep.name)",
+            {"id": node_id, "rels": safe_rels},
+        )
+        return [dict(r) for r in rows]
 
     def find_similar_nodes(self, name: str, kind: str, limit: int = 10) -> List[Dict]:
         if not self._available:

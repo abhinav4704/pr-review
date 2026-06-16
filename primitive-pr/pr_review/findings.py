@@ -74,6 +74,20 @@ class Finding:
     evidence: str
     recommendation: str
     kind: str = "issue"
+    prompt_id: str = ""
+    changed_file: str = ""
+    changed_function: str = ""
+    dependent_function: str = ""
+    dependent_file: str = ""
+    dependent_line: int = 0
+    callsite_file: str = ""
+    callsite_line: int = 0
+    chain_line_non_llm: str = ""
+    chain_source: str = ""
+    provenance_status: str = ""
+    impact_reason: str = ""
+    source_fix_example: str = ""
+    dependent_fix_example: str = ""
 
     @classmethod
     def from_dict(cls, d: dict, default_file: str = "") -> Optional["Finding"]:
@@ -97,6 +111,20 @@ class Finding:
                 evidence=str(d.get("evidence", "")).strip(),
                 recommendation=str(d.get("recommendation", "")).strip(),
                 kind=kind,
+                prompt_id=str(d.get("prompt_id", "")).strip(),
+                changed_file=str(d.get("changed_file", "")).strip(),
+                changed_function=str(d.get("changed_function", "")).strip(),
+                dependent_function=str(d.get("dependent_function", "")).strip(),
+                dependent_file=str(d.get("dependent_file", "")).strip(),
+                dependent_line=int(d.get("dependent_line", 0) or 0),
+                callsite_file=str(d.get("callsite_file", "")).strip(),
+                callsite_line=int(d.get("callsite_line", 0) or 0),
+                chain_line_non_llm=str(d.get("chain_line_non_llm", "")).strip(),
+                chain_source=str(d.get("chain_source", "")).strip(),
+                provenance_status=str(d.get("provenance_status", "")).strip(),
+                impact_reason=str(d.get("impact_reason", "")).strip(),
+                source_fix_example=str(d.get("source_fix_example", "")).strip(),
+                dependent_fix_example=str(d.get("dependent_fix_example", "")).strip(),
             )
         except (TypeError, ValueError):
             return None
@@ -165,7 +193,13 @@ def dedupe(findings: List[Finding]) -> List[Finding]:
     """
     best: dict = {}
     for f in findings:
-        key = (f.file, f.line // 5, _norm_title(f.title))
+        key = (
+            f.file,
+            f.line // 5,
+            _norm_title(f.title),
+            (f.changed_function or "").strip().lower(),
+            (f.prompt_id or "").strip().lower(),
+        )
         cur = best.get(key)
         if cur is None or SEVERITY_WEIGHT.get(f.severity, 0) > SEVERITY_WEIGHT.get(cur.severity, 0):
             best[key] = f
