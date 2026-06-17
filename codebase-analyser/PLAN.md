@@ -36,7 +36,7 @@ pr-review/pr-review/
       extract_unresolved.py     # (Phase 1.5) capture broken refs before resolution
       scanners/                 # text/manifest scanners (no LLM)
         secrets.py  dependencies.py
-      comprehension.py          # god nodes + communities (vendored analyze/cluster)
+      comprehension.py          # god nodes + communities (networkx, no vendor deps)
     audit_frontend.py           # Streamlit page
     requirements.txt
 ```
@@ -67,8 +67,10 @@ source (download_source or local path)
 - `impact.reverse_dependents` + helpers (blast radius / "what breaks what").
 - `pr_passes.pass_whole_file` + `WHOLE_FILE_SYSTEM`; `review_llm.make_completion_fn`.
 - `findings.Finding`, `severity_counts`, `SEV_BADGE`, `sort_by_severity`, `dedupe`.
-- Vendored comprehension: `vendor_graph.analyze.god_nodes` / `surprising_connections`,
-  `vendor_graph.cluster.cluster`.
+- Comprehension: god-node detection and module community detection computed directly
+  from the in-memory `CodeGraph` using `networkx` — `cg.fan_in()` for god nodes,
+  `networkx.algorithms.community.greedy_modularity_communities` for module communities.
+  No vendored modules required (`vendor_graph/` has been deleted).
 
 ---
 
@@ -85,7 +87,8 @@ source (download_source or local path)
 - **Secrets** (scanner) — provider regexes + entropy.
 - **Dependencies** (scanner) — manifests + OSV.dev CVEs + unused/undeclared.
 - **LLM review** — one `pass_whole_file` per top-K file.
-- **Comprehension** — god nodes + communities.
+- **Comprehension** — god nodes (high fan-in via `cg.fan_in()`) + module communities
+  (networkx greedy modularity on module-level graph projection; no vendor dependency).
 
 Decision: deterministic checks compute from the **in-memory CodeGraph** so the audit runs
 without requiring a live Neo4j; Neo4j push stays optional (persistence/exploration). This
@@ -124,8 +127,10 @@ queries).
 ### Done
 - Architecture designed and approved (this plan).
 - Reuse surface mapped in `primitive-pr/pr_review` (graph, neo4j_store, architecture,
-  impact, pass_whole_file, findings, vendored analyze/cluster).
+  impact, pass_whole_file, findings).
 - Key constraint discovered: unresolved refs are dropped at build (affects breakage design).
+- `vendor_graph/` folder and `graphify_adapter.py` **deleted** from `primitive-pr/pr_review/`;
+  comprehension phase now uses networkx directly — no vendor dependency.
 - **No code written yet** for the analyser.
 
 ### To do (nothing started)
@@ -141,3 +146,4 @@ queries).
 
 ### Not changing
 - `primitive-pr/` and its `pr_review` package — reused read-only via `analyser/paths.py`.
+- `vendor_graph/` is permanently removed; do not add it back.
