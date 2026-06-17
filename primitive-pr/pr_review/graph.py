@@ -33,7 +33,6 @@ from typing import Dict, List, Optional, Set, Tuple
 import networkx as nx
 
 from .graph_contract import confidence_score, edge_relation, normalize_confidence
-from .graphify_adapter import try_build_with_graphify
 
 
 DEFAULT_IMPACT_RELATIONS = {
@@ -795,24 +794,12 @@ def _sync_edge_contract(g: nx.DiGraph) -> None:
 
 # ── build_graph ────────────────────────────────────────────────────────────────
 def build_graph(root: str, max_files: int = 5000, backend: str = "primitive") -> CodeGraph:
+    if backend not in {"primitive", None, ""}:
+        raise ValueError(
+            f"Unsupported graph backend: {backend!r}. Only 'primitive' is supported."
+        )
     cg = CodeGraph(root=os.path.abspath(root))
     g = cg.g
-
-    if backend == "vendored":
-        backend = "graphify"
-
-    if backend in {"graphify", "auto"}:
-        adapted = try_build_with_graphify(root, max_files=max_files)
-        if adapted is not None:
-            graph, lang_counts, by_simple = adapted
-            cg.g = graph
-            cg.lang_counts = lang_counts
-            cg._by_simple = by_simple
-            return cg
-        if backend == "graphify":
-            raise RuntimeError(
-                "Graphify backend requested but graphify package is unavailable."
-            )
 
     # collect all supported source files
     source_files: List[Tuple[str, str]] = []  # (rel_path, lang)

@@ -38,6 +38,9 @@ ss.setdefault("prompts", {})
 ss.setdefault("file_chains", {})
 ss.setdefault("diff_raw", "")
 ss.setdefault("target_ref", "")
+# Normalize legacy session values that referenced vendored/auto backend.
+if ss.get("backend") not in {"primitive", None}:
+    ss["backend"] = "primitive"
 ss.setdefault("backend", "primitive")
 ss.setdefault("review_results", [])
 
@@ -92,8 +95,7 @@ with st.sidebar:
 
     st.divider()
     st.header("Graph")
-    ss.backend = st.selectbox("Build backend", ["vendored", "primitive", "auto"],
-                              index=["vendored", "primitive", "auto"].index(ss.backend))
+    ss.backend = st.selectbox("Build backend", ["primitive"], index=0)
     depth = st.slider("Dependent traversal depth", 1, 5, 2)
 
     st.divider()
