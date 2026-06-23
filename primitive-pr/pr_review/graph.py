@@ -77,7 +77,14 @@ def _load_languages() -> Dict[str, object]:
         from tree_sitter import Language
         import tree_sitter_javascript as _tsjs
         langs["javascript"] = Language(_tsjs.language())
-        langs["typescript"] = langs["javascript"]
+        try:
+            from tree_sitter import Language
+            import tree_sitter_typescript as _tsts
+            langs["typescript"] = Language(_tsts.language_typescript())
+        except Exception:
+            # Fall back to JavaScript grammar if tree-sitter-typescript is not installed
+            if "javascript" in langs:
+                langs["typescript"] = langs["javascript"]
     except Exception:
         pass
     try:
@@ -135,8 +142,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
 class GraphFeatureFlags:
     """Feature flags for staged, backward-compatible graph upgrades."""
 
-    enable_language_specific_extractors: bool = False
-    enable_cross_language_api_links: bool = False
+    enable_language_specific_extractors: bool = True
+    enable_cross_language_api_links: bool = True
     strict_language_mode: bool = False
     max_reexport_depth: int = 2
 
@@ -1181,7 +1188,57 @@ class _JavaExtractor(_GenericExtractor):
 
 
 class _JsTsExtractor(_GenericExtractor):
-    """JS/TS-specialized extractor entrypoint (keeps current behavior for now)."""
+    """JS/TS-specialized extractor with proper handling of named arrow functions."""
+
+    def _walk(self, node) -> None:
+        if node.type == "export_statement":
+            # Check if this export wraps a lexical_declaration (const/let foo = ...)
+            for ch in node.children:
+                if ch.type == "lexical_declaration":
+                    self._handle_lexical_decl(ch)
+                    # Walk any other non-lexical children (e.g. decorators) normally
+                    for other in node.children:
+                        if other.type != "lexical_declaration":
+                            self._walk(other)
+                    return
+            # No lexical_declaration found — let super handle it (export function, export class, etc.)
+            super()._walk(node)
+            return
+
+        if node.type == "lexical_declaration":
+            self._handle_lexical_decl(node)
+            return
+
+        # Everything else: default _GenericExtractor behavior
+        super()._walk(node)
+
+    def _handle_lexical_decl(self, decl_node) -> None:
+        """Extract named arrow functions and function expressions from const/let declarations."""
+        for ch in decl_node.children:
+            if ch.type != "variable_declarator":
+                continue
+            name_node = ch.child_by_field_name("name")
+            val = ch.child_by_field_name("value")
+            if not name_node or not val:
+                continue
+            if val.type in ("arrow_function", "function_expression"):
+                name = _text(name_node)
+                if not name:
+                    continue
+                start, end = val.start_point[0] + 1, val.end_point[0] + 1
+                nid = self._add_def("function", name, start, end)
+                self._scope.append(name)
+                body = val.child_by_field_name("body")
+                if body:
+                    for call_node in self._iter_calls(body):
+                        tgt = self._call_name(call_node)
+                        if tgt:
+                            etype = "instantiates" if tgt[0].isupper() else "calls"
+                            self.g.add_edge(nid, f"__unresolved__::{tgt}", type=etype)
+                self._scope.pop()
+            else:
+                # Value is a class expression or something else — walk it so inner defs are found
+                self._walk(val)
 
 
 class _GoExtractor(_GenericExtractor):
@@ -1192,8 +1249,6 @@ def _extractor_cls_for_language(
     lang: str,
     flags: GraphFeatureFlags,
 ):
-    if not flags.enable_language_specific_extractors:
-        return _GenericExtractor
     if lang == "java":
         return _JavaExtractor
     if lang in {"javascript", "typescript"}:
@@ -1663,7 +1718,7 @@ def _extract_route_signatures_from_source(src: str, lang: str) -> List[Tuple[str
                 if path:
                     out.append((method, path))
     elif lang in {"javascript", "typescript"}:
-        # @Get('/x') style decorators
+        # @Get('/x') style decorators (NestJS)
         for m in re.finditer(
             r"@(Get|Post|Put|Patch|Delete)\s*\(\s*['\"]([^'\"]+)['\"]",
             text,
@@ -1673,6 +1728,17 @@ def _extract_route_signatures_from_source(src: str, lang: str) -> List[Tuple[str
             path = _normalize_api_path(m.group(2))
             if path:
                 out.append((method, path))
+        # Express / Fastify: app.get('/path', handler) or router.post('/path', ...)
+        for m in re.finditer(
+            r'\b(?:app|router|server|fastify)\.'
+            r'(get|post|put|patch|delete)\s*\(\s*[\'"]([^\'"]+)[\'"]',
+            text,
+            flags=re.I,
+        ):
+            method = m.group(1).upper()
+            path_val = _normalize_api_path(m.group(2))
+            if path_val:
+                out.append((method, path_val))
 
     # Dedupe while preserving order
     dedup: List[Tuple[str, str]] = []
@@ -1930,6 +1996,8 @@ def build_graph(
         elif lang == "python":
             _ast_fallback(path, src_text, g, cg._by_simple, module_index,
                           import_bindings.setdefault(path, {}))
+        elif lang == "java":
+            _java_regex_fallback(path, src_text, g, cg._by_simple, import_bindings)
 
     _resolve(g, cg._by_simple, import_bindings, max_reexport_depth=flags.max_reexport_depth)
     _resolve_overrides(g)
@@ -2021,3 +2089,105 @@ def _ast_fallback(path: str, src: str, g: nx.DiGraph,
 
     for n in tree.body:
         visit(n)
+
+
+def _java_regex_fallback(
+    path: str,
+    src_text: str,
+    g: nx.DiGraph,
+    by_simple: Dict[str, List[str]],
+    import_bindings: Dict[str, Dict[str, str]],
+) -> None:
+    """Regex-based Java extraction used when tree-sitter-java is unavailable."""
+    is_test = _is_test_path(path)
+    import_bindings.setdefault(path, {})
+    lines = src_text.splitlines()
+
+    _HTTP_ANNS = {
+        "GetMapping", "PostMapping", "PutMapping",
+        "PatchMapping", "DeleteMapping", "RequestMapping",
+    }
+    _SVC_ANNS  = {"Service", "Component", "Repository"}
+    _CTRL_ANNS = {"RestController", "Controller"}
+    _CTRL_KW   = {"if", "while", "for", "switch", "catch", "try", "else", "do"}
+
+    def _anns_before(lineno: int) -> Set[str]:
+        """Return annotation names found on up to 5 lines immediately before lineno."""
+        out: Set[str] = set()
+        for j in range(lineno - 2, max(lineno - 7, -1), -1):
+            if not (0 <= j < len(lines)):
+                break
+            s = lines[j].strip()
+            if not s or s.startswith("//") or s.startswith("/*"):
+                continue
+            if s.startswith("@"):
+                for m in re.finditer(r"@(\w+)", s):
+                    out.add(m.group(1))
+            else:
+                break  # non-annotation, non-blank line stops the search
+        return out
+
+    # ── class declarations ────────────────────────────────────────────────────────────────────────────
+    cls_lines: List[Tuple[int, str]] = []   # (start_line, class_name)
+
+    for m in re.finditer(
+        r'(?:^|\n)[ \t]*(?:(?:public|protected|private|abstract|final)\s+)*class\s+(\w+)',
+        src_text,
+    ):
+        cls = m.group(1)
+        line = src_text[: m.start()].count("\n") + 1
+        anns = _anns_before(line)
+        kind = (
+            "service" if anns & _SVC_ANNS
+            else "route" if anns & _CTRL_ANNS
+            else "class"
+        )
+        nid = f"{path}::{cls}"
+        g.add_node(nid, kind=kind, path=path, name=cls, qualname=cls,
+                   start_line=line, end_line=line, lang="java", is_test=is_test)
+        g.add_edge(path, nid, type="defines")
+        by_simple.setdefault(cls, []).append(nid)
+        cls_lines.append((line, cls))
+
+    cls_lines.sort()
+
+    def _enclosing_class(method_line: int) -> str:
+        """Return the name of the last class declared at or before method_line."""
+        best = ""
+        for cline, cname in cls_lines:
+            if cline <= method_line:
+                best = cname
+        return best
+
+    # ── method declarations ───────────────────────────────────────────────────────────────────────
+    # Match: optional modifiers + return_type + methodName + ( params ) + optional throws + {
+    _METH_RE = re.compile(
+        r'(?:^|\n)[ \t]*(?:(?:public|protected|private|static|final|abstract|synchronized|@\w+)\s+)*'
+        r'(?:[\w<>\[\],\s]+?\s+)'   # return type (non-greedy)
+        r'(\w+)\s*\([^)]*\)'        # method name + params
+        r'(?:\s+throws\s+[\w,\s]+)?'
+        r'\s*\{',
+        re.M,
+    )
+
+    for m in _METH_RE.finditer(src_text):
+        mname = m.group(1)
+        if mname in _CTRL_KW:
+            continue
+        line = src_text[: m.start()].count("\n") + 1
+        cls = _enclosing_class(line)
+        if not cls:
+            continue
+        anns = _anns_before(line)
+        kind = "route" if anns & _HTTP_ANNS else "method"
+        qualname = f"{cls}.{mname}"
+        nid = f"{path}::{qualname}"
+        if nid in g:          # skip duplicate matches of the same method
+            continue
+        g.add_node(nid, kind=kind, path=path, name=mname, qualname=qualname,
+                   start_line=line, end_line=line, lang="java", is_test=is_test)
+        g.add_edge(path, nid, type="defines")
+        cls_nid = f"{path}::{cls}"
+        if cls_nid in g:
+            g.add_edge(cls_nid, nid, type="defines")
+        by_simple.setdefault(mname, []).append(nid)
