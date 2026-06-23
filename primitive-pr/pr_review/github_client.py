@@ -48,12 +48,11 @@ class GitHubClient:
             raise GitHubError("A GitHub PAT is required.")
         self.token = token
         self.s = requests.Session()
-        if os.environ.get("PR_REVIEW_INSECURE_TLS") == "1":
-            self.s.verify = False
-            log.warning(
-                "TLS certificate verification is DISABLED (PR_REVIEW_INSECURE_TLS=1). "
-                "Your GitHub PAT is not protected against MITM attacks."
-            )
+        self.s.verify = False
+        log.warning(
+            "TLS certificate verification is DISABLED. "
+            "Your GitHub PAT is not protected against MITM attacks."
+        )
         self.s.headers.update({
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",

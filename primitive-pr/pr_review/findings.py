@@ -210,6 +210,29 @@ def sort_by_severity(findings: List[Finding]) -> List[Finding]:
     return sorted(findings, key=lambda f: SEVERITY_ORDER.get(f.severity, 9))
 
 
+def dedupe_cross_track(findings: List[Finding]) -> List[Finding]:
+    """Deduplicate findings that refer to the same issue across different tracks.
+
+    Unlike ``dedupe()``, this ignores ``changed_function`` and ``prompt_id`` so
+    that Track A and Track B findings about the same file/line/topic collapse into
+    a single entry.  The highest-severity copy is kept.
+
+    Use this when merging findings from multiple tracks before handing them to the
+    synthesis LLM to prevent the same bug appearing twice with different severities.
+    """
+    best: dict = {}
+    for f in findings:
+        key = (
+            f.file,
+            f.line // 5,
+            _norm_title(f.title),
+        )
+        cur = best.get(key)
+        if cur is None or SEVERITY_WEIGHT.get(f.severity, 0) > SEVERITY_WEIGHT.get(cur.severity, 0):
+            best[key] = f
+    return list(best.values())
+
+
 def severity_counts(findings: List[Finding]) -> dict:
     counts = {s: 0 for s in SEVERITY_WEIGHT}
     for f in findings:

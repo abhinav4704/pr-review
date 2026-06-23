@@ -12,7 +12,14 @@ from .graph import DEFAULT_IMPACT_RELATIONS
 from .graph_contract import edge_relation, is_ambiguous_confidence
 from .pr_passes import number_lines, read_source
 
-_DEPENDENT_KINDS = {"function", "method", "route", "event"}
+_DEPENDENT_KINDS = {
+    "function", "method", "route", "event", "class", "table",
+    "field", "interface", "type_alias", "enum", "variable", "service",
+}
+_CHANGED_KINDS = {
+    "function", "method", "route", "event", "class", "table",
+    "field", "interface", "type_alias", "enum", "variable", "service",
+}
 
 
 _MIN_REASONABLE_BLOCK_LINES = 4
@@ -320,6 +327,140 @@ def build_changed_file_chains(cg: CodeGraph, diff_text: str,
                 "dependent_files": sorted(dependent_files),
                 "chain_paths": sorted(chain_paths),
             }
+
+    return chains
+
+
+def _selected_function_nodes(cg: CodeGraph, selected_files: List[str]) -> List[str]:
+    """Collect changed-symbol node ids from selected files in stable order."""
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    for path in selected_files:
+        resolved_paths = _path_candidates(cg, path)
+        used_path = ""
+        for cand in resolved_paths:
+            if cg.defs_in_file(cand):
+                used_path = cand
+                break
+        if not used_path:
+            continue
+
+        nids = [nid for nid in cg.defs_in_file(used_path) if cg.has(nid)]
+        nids.sort(key=lambda nid: (
+            int(cg.node(nid).get("start_line") or 0),
+            str(cg.node(nid).get("qualname") or cg.node(nid).get("name") or nid),
+        ))
+        for nid in nids:
+            kind = str(cg.node(nid).get("kind") or "")
+            if kind not in _CHANGED_KINDS:
+                continue
+            if nid in seen:
+                continue
+            seen.add(nid)
+            out.append(nid)
+    return out
+
+
+def build_prompts_for_selected_files(cg: CodeGraph, src_path: str,
+                                     selected_files: List[str],
+                                     depth: int = 2,
+                                     max_dependents_per_changed: int = 25) -> Dict[str, str]:
+    """Build one prompt per selected symbol in user-selected files (no diff required)."""
+    prompts: Dict[str, str] = {}
+
+    for nid in _selected_function_nodes(cg, selected_files):
+        d = cg.node(nid)
+        file_path = str(d.get("path") or "")
+        if not file_path:
+            continue
+
+        label = str(d.get("qualname") or d.get("name") or nid)
+        prompt_id = f"{file_path}::{label}"
+        if prompt_id in prompts:
+            start = int(d.get("start_line") or 0)
+            prompt_id = f"{file_path}::{label}@{start}"
+
+        parts: List[str] = [
+            f"# Manual review context for {file_path}",
+            "",
+            "## Task",
+            "Review this changed symbol and its dependent symbols.",
+            "Report concrete breakages and risky behavior changes.",
+            "",
+            "## Selected symbol",
+        ]
+
+        block = _render_node_block(cg, src_path, nid, "Changed")
+        if block:
+            parts.append(block)
+
+        dependent_set: Set[str] = set()
+        deps = _dependent_nodes(cg, nid, depth=depth)
+        for dep in deps[:max_dependents_per_changed]:
+            dependent_set.add(dep)
+
+        if dependent_set:
+            parts.append("## Dependent symbols")
+            for dep_nid in sorted(dependent_set):
+                dep_block = _render_node_block(cg, src_path, dep_nid, "Dependent")
+                if dep_block:
+                    parts.append(dep_block)
+        else:
+            parts.append("## Dependent symbols")
+            parts.append(
+                "No dependent symbols were found at the selected traversal depth."
+            )
+
+        prompts[prompt_id] = "\n".join(parts).strip()
+
+    return prompts
+
+
+def build_selected_file_chains(cg: CodeGraph, selected_files: List[str],
+                               depth: int = 2) -> Dict[str, Dict[str, List[str] | str]]:
+    """Build per-function dependency chain summaries for selected files."""
+    chains: Dict[str, Dict[str, List[str] | str]] = {}
+
+    for nid in _selected_function_nodes(cg, selected_files):
+        if not cg.has(nid):
+            continue
+
+        d = cg.node(nid)
+        file_path = str(d.get("path") or "")
+        if not file_path:
+            continue
+
+        fn_label = str(d.get("qualname") or d.get("name") or nid)
+        chain_key = f"{file_path}::{fn_label}"
+        if chain_key in chains:
+            start = int(d.get("start_line") or 0)
+            chain_key = f"{file_path}::{fn_label}@{start}"
+
+        dependent_files: Set[str] = set()
+        chain_paths: Set[str] = set()
+
+        deps = cg.reverse_dependents(nid, depth=depth)
+        for dep_id in deps:
+            if not cg.has(dep_id):
+                continue
+            dep_path = str(cg.node(dep_id).get("path") or "")
+            if dep_path and dep_path != file_path:
+                dependent_files.add(dep_path)
+
+            node_path = _reverse_shortest_path(cg, nid, dep_id, depth=depth)
+            if not node_path:
+                continue
+            file_chain = _node_path_to_file_chain(cg, node_path)
+            if len(file_chain) >= 2:
+                chain_paths.add(" -> ".join(file_chain))
+
+        chains[chain_key] = {
+            "changed_file": file_path,
+            "changed_function": fn_label,
+            "dependent_files": sorted(dependent_files),
+            "chain_paths": sorted(chain_paths),
+        }
 
     return chains
 

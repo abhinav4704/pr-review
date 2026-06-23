@@ -21,33 +21,35 @@ from .prompt_builder import build_changed_file_chains, build_prompts_by_function
 CompleteFn = Callable[[str, str], str]
 
 DEPENDENCY_SYSTEM = (
-    "You are checking whether a code change breaks the functions that depend on it. "
+    "You are AGENT 2 — the caller-breakage checker. Your only job is to answer one question "
+    "for each DEPENDENT SYMBOL shown: does the change break this caller?\n"
     "You are given three things:\n"
     "1. The DIFF of the changed file (what changed).\n"
-    "2. The CHANGED FUNCTION (the origin of the change), with line numbers in the left margin.\n"
-    "3. One or more DEPENDENT CALLER FUNCTIONS that use the changed function. Each is shown "
+    "2. The CHANGED SYMBOL (the origin of the change), with line numbers in the left margin.\n"
+    "3. One or more DEPENDENT SYMBOLS that call or use the changed symbol. Each is shown "
     "under a heading with its file path and line range, and every line has its real line "
     "number in the left margin.\n\n"
-    "For each DEPENDENT caller function, decide whether the change actually breaks it. It breaks "
-    "if the dependent still relies on something the change altered — a renamed or removed "
-    "field/attribute, a different return value or type, changed arguments, or a new error. "
-    "When it breaks, report category 'breaking' (severity critical) and:\n"
-    "- set \"file\" to the DEPENDENT's file path (exactly as shown in its heading) and \"line\" to "
-    "the exact line in that dependent that breaks — read the number from the left margin, do not "
-    "guess or count.\n"
-    "- put the exact broken line of code in \"evidence\" (e.g. `response.response`).\n"
-    "- in \"explanation\", name the changed function and what it changed, then name the dependent "
-    "and its breaking line, e.g. \"generate_completion_response now returns `output_text` instead "
-    "of `response`, so analyze_metrics (insights_llm_service.py:116) still reads "
-    "`response.response` and will fail\".\n"
-    "- in \"recommendation\", give the concrete consumer-side fix (e.g. change `response.response` "
-    "to `response.output_text` at every callsite), or note that the change should be reverted.\n\n"
-    "GROUNDING RULES (important):\n"
-    "- Only use file paths and line numbers that literally appear in this prompt. Never invent a "
-    "path such as `path/to/file.py`.\n"
-    "- If a dependent does not actually use what changed, do not report it.\n"
-    "- If you cannot tie a problem to a specific dependent line shown here, drop it.\n"
-    "- Do not report unrelated legacy issues.\n\n"
+    "YOUR SCOPE — report only:\n"
+    "- A DEPENDENT SYMBOL that still uses something the change removed, renamed, or altered "
+    "(a field, return value, argument, or thrown error that no longer exists or has a different "
+    "shape). Severity: critical, category: breaking.\n"
+    "- Set 'file' to the DEPENDENT's file path and 'line' to the exact breaking line in that "
+    "dependent — read the number from the left margin, do not count or guess.\n"
+    "- Put the exact broken line of code in 'evidence'.\n"
+    "- In 'explanation': name the changed symbol and what specifically changed, then name the "
+    "dependent and its breaking line. Example: 'emit() now prefixes msg with [DEBUG], so "
+    "Svc.run (Svc.java:3) calls logger.info() which calls emit() and will now produce "
+    "unexpected output'.\n"
+    "- In 'recommendation': give the concrete fix at the caller side.\n\n"
+    "OUT OF SCOPE — do NOT report:\n"
+    "- Bugs, style issues, or improvements inside the CHANGED SYMBOL. That is Agent 1's job.\n"
+    "- Any finding in the same file as the changed symbol (Agent 1 already covers it).\n"
+    "- General code quality issues in the dependent symbols unrelated to the change.\n"
+    "- A dependent that does not actually call or reference what changed.\n\n"
+    "GROUNDING RULES (non-negotiable):\n"
+    "- Only use file paths and line numbers that literally appear in this prompt.\n"
+    "- Never invent paths like `path/to/file.py`, `example.py`, or any placeholder.\n"
+    "- If you cannot tie the breakage to a specific line shown here, drop the finding.\n\n"
     + FINDINGS_SCHEMA
 )
 
@@ -203,7 +205,7 @@ def _build_mapping_text(
     rename_pair: Tuple[str, str],
 ) -> Tuple[str, str, str]:
     old_name, new_name = rename_pair
-    dep_name = dependent_function or "dependent caller"
+    dep_name = dependent_function or "unknown-dependent"
 
     if old_name and new_name:
         impact_reason = (
@@ -250,14 +252,32 @@ def _enrich_dependency_findings(
         f.changed_file = ctx.changed_file
         f.changed_function = ctx.changed_function
 
+        llm_file = str(f.file or "")
+        llm_line = int(f.line or 0)
+
         dep = _choose_dependent_from_finding(f, ctx)
         if dep:
-            f.dependent_function = str(dep.get("label") or "")
-            f.dependent_file = str(dep.get("file") or "")
-            f.dependent_line = int(dep.get("start") or 0)
+            dep_label = str(dep.get("label") or "")
+            dep_file = str(dep.get("file") or "")
+            dep_start = int(dep.get("start") or 0)
+            dep_end = int(dep.get("end") or 0)
 
-        f.callsite_file = f.file
-        f.callsite_line = f.line
+            f.dependent_function = dep_label
+            f.dependent_file = dep_file
+            f.dependent_line = dep_start
+
+            # For dependency findings, keep the primary file/line anchored to
+            # graph-verified dependent context instead of raw LLM placeholders.
+            if dep_file:
+                f.file = dep_file
+            if dep_start > 0 and not (llm_file == dep_file and dep_start <= llm_line <= dep_end):
+                f.line = dep_start
+
+        if _is_placeholder_path(str(f.file or "")):
+            f.file = ""
+
+        f.callsite_file = llm_file or str(f.file or "")
+        f.callsite_line = llm_line or int(f.line or 0)
 
         # Additive only: when the change is a rename and this finding maps to a
         # dependent, append the FULL list of callsites (all places the dependent
@@ -431,6 +451,33 @@ def _synthesize_graph_context_findings(
     return synthesized
 
 
+def _is_placeholder_path(path: str) -> bool:
+    p = (path or "").strip().lower().replace("\\", "/")
+    if not p:
+        return False
+    placeholder_tokens = (
+        "path/to/",
+        "example.py",
+        "your_file",
+        "placeholder",
+    )
+    return any(tok in p for tok in placeholder_tokens)
+
+
+def _publishable_dependency_findings(findings: List[Finding]) -> List[Finding]:
+    allowed_provenance = {"confirmed_graph_context", "graph_file_context", "graph_context_only"}
+    out: List[Finding] = []
+    for f in findings:
+        if f.provenance_status not in allowed_provenance:
+            continue
+        if _is_placeholder_path(str(f.file or "")):
+            continue
+        if _is_placeholder_path(str(f.dependent_file or "")):
+            continue
+        out.append(f)
+    return out
+
+
 def _diff_by_file(diff_text: str) -> Dict[str, str]:
     """Split unified diff into per-file diff blocks."""
     out: Dict[str, List[str]] = {}
@@ -580,6 +627,102 @@ def run_two_agent_review(
                         enriched = _synthesize_graph_context_findings(
                             enriched, ctx, rename_pair, src_path
                         )
+                    enriched = _publishable_dependency_findings(enriched)
+                    reviews[file_key].dependency_findings.extend(enriched)
+                    if ctx:
+                        reviews[file_key].dependency_findings_by_function.setdefault(
+                            ctx.changed_function, []
+                        ).extend(enriched)
+            except Exception as exc:
+                msg = f"{kind} failed: {exc}"
+                if msg not in reviews[file_key].errors:
+                    reviews[file_key].errors.append(msg)
+
+    out: List[FileReview] = []
+    for path in sorted(reviews.keys()):
+        fr = reviews[path]
+        fr.file_findings = sort_by_severity(dedupe(fr.file_findings))
+        fr.dependency_findings = sort_by_severity(dedupe(fr.dependency_findings))
+        grouped: Dict[str, List[Finding]] = {}
+        for fn_name, items in fr.dependency_findings_by_function.items():
+            grouped[fn_name] = sort_by_severity(dedupe(items))
+        fr.dependency_findings_by_function = grouped
+        out.append(fr)
+    return out
+
+
+def run_two_agent_review_manual(
+    cg,
+    src_path: str,
+    selected_files: List[str],
+    prompts: Dict[str, str],
+    chains: Dict[str, Dict[str, object]],
+    complete: CompleteFn,
+    budget: int = DEFAULT_BUDGET,
+    max_workers: int = 4,
+) -> List[FileReview]:
+    """Run two-agent review for manual file selection mode (no diff parsing)."""
+    changed_files = sorted({p for p in selected_files if str(p).strip()})
+    if not changed_files:
+        return []
+
+    prompt_contexts: Dict[str, PromptContext] = {
+        prompt_id: _context_from_prompt(prompt_id, prompt, chains.get(prompt_id))
+        for prompt_id, prompt in prompts.items()
+    }
+
+    reviews: Dict[str, FileReview] = {path: FileReview(path=path) for path in changed_files}
+
+    def _agent1(path: str) -> Tuple[str, List[Finding]]:
+        return path, pass_whole_file(
+            path,
+            src_path,
+            complete,
+            budget=budget,
+            diff_text="",
+        )
+
+    workers = max(1, min(max_workers, len(changed_files) + len(prompts)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = []
+
+        for path in changed_files:
+            futures.append(("agent1", path, pool.submit(_agent1, path)))
+
+        for prompt_id, prompt in prompts.items():
+            origin_file = prompt_id.split("::", 1)[0]
+            if origin_file not in reviews:
+                reviews[origin_file] = FileReview(path=origin_file)
+            futures.append(
+                (
+                    "agent2",
+                    origin_file,
+                    pool.submit(
+                        _run_dependency_prompt,
+                        complete,
+                        prompt_id,
+                        prompt,
+                        "",
+                        budget,
+                    ),
+                )
+            )
+
+        for kind, file_key, fut in futures:
+            try:
+                if kind == "agent1":
+                    _path, findings = fut.result()
+                    reviews[file_key].file_findings.extend(findings)
+                else:
+                    prompt_id, _origin, findings = fut.result()
+                    ctx = prompt_contexts.get(prompt_id)
+                    rename_pair = ("", "")
+                    enriched = _enrich_dependency_findings(findings, ctx, rename_pair, src_path) if ctx else findings
+                    if ctx:
+                        enriched = _synthesize_graph_context_findings(
+                            enriched, ctx, rename_pair, src_path
+                        )
+                    enriched = _publishable_dependency_findings(enriched)
                     reviews[file_key].dependency_findings.extend(enriched)
                     if ctx:
                         reviews[file_key].dependency_findings_by_function.setdefault(

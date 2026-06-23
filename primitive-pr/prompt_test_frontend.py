@@ -15,9 +15,15 @@ import streamlit as st
 from pr_review.github_client import GitHubClient, GitHubError
 from pr_review.findings import SEV_BADGE, severity_counts
 from pr_review.graph import build_graph
-from pr_review.prompt_builder import build_changed_file_chains, build_prompts_by_function
+from pr_review.prompt_builder import (
+    build_changed_file_chains,
+    build_prompts_by_function,
+    build_prompts_for_selected_files,
+    build_selected_file_chains,
+)
 from pr_review.review_llm import make_completion_fn
-from pr_review.two_agent_review import run_two_agent_review
+from pr_review.two_agent_review import run_two_agent_review, run_two_agent_review_manual
+from pr_review.upload_utils import materialize_uploaded_sources
 
 try:
     from dotenv import load_dotenv
@@ -43,6 +49,14 @@ if ss.get("backend") not in {"primitive", None}:
     ss["backend"] = "primitive"
 ss.setdefault("backend", "primitive")
 ss.setdefault("review_results", [])
+ss.setdefault("manual_ref", "")
+ss.setdefault("manual_files", [])
+ss.setdefault("manual_repo_files", [])
+ss.setdefault("manual_loaded_ref", "")
+ss.setdefault("review_mode", "")
+ss.setdefault("manual_prompt_selected", {})
+ss.setdefault("upload_src_path", "")
+ss.setdefault("upload_files", [])
 
 
 def _parse_diff_files(diff_text: str) -> List[Dict]:
@@ -69,6 +83,50 @@ def _parse_diff_files(diff_text: str) -> List[Dict]:
     if cur:
         out.append(cur)
     return [x for x in out if x["path"]]
+
+
+_DEFAULT_CODE_EXTS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php",
+    ".cs", ".swift", ".kt", ".kts", ".scala", ".m", ".mm", ".c", ".cc", ".cpp",
+    ".h", ".hpp", ".sql", ".sh", ".bash", ".zsh", ".ps1", ".yaml", ".yml", ".toml",
+    ".json", ".xml", ".proto", ".graphql",
+}
+
+
+def _list_repo_files(src_root: str) -> List[str]:
+    out: List[str] = []
+    if not src_root or not os.path.isdir(src_root):
+        return out
+
+    skip_dirs = {".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv"}
+    for dirpath, dirnames, filenames in os.walk(src_root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+        for fname in filenames:
+            if fname.startswith("."):
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in _DEFAULT_CODE_EXTS:
+                continue
+            abs_path = os.path.join(dirpath, fname)
+            rel_path = os.path.relpath(abs_path, src_root).replace("\\", "/")
+            out.append(rel_path)
+    return sorted(set(out))
+
+
+def _manual_diff_overview(selected_files: List[str]) -> str:
+    lines: List[str] = []
+    for path in selected_files:
+        lines.extend(
+            [
+                f"diff --git a/{path} b/{path}",
+                f"--- a/{path}",
+                f"+++ b/{path}",
+                "@@ manual-selection @@",
+                "+MANUAL FILE SELECTED",
+                "",
+            ]
+        )
+    return "\n".join(lines).strip()
 
 
 def _connect_github(token: str) -> None:
@@ -125,10 +183,11 @@ if not ss.gh:
     st.stop()
 
 repo = st.selectbox("Repository", ss.repos)
-mode = st.radio("Target", ["Pull Request", "Commit"], horizontal=True)
+mode = st.radio("Target", ["Pull Request", "Commit", "Manual Files", "Upload Files"], horizontal=True)
 
 pr = None
 commit = None
+manual_ref = ""
 if mode == "Pull Request":
     pulls = ss.gh.list_pulls(repo)
     if not pulls:
@@ -136,7 +195,7 @@ if mode == "Pull Request":
     else:
         options = {f"#{p.number} - {p.title}": p for p in pulls}
         pr = options[st.selectbox("Pull request", list(options.keys()))]
-else:
+elif mode == "Commit":
     branches = ss.gh.list_branches(repo)
     branch = st.selectbox("Branch", branches) if branches else None
     commits = ss.gh.list_commits(repo, branch) if branch else []
@@ -148,8 +207,104 @@ else:
             commits,
             format_func=lambda c: f"{c.sha[:7]} {c.date} {c.author}: {c.message}",
         )
+else:
+    if mode == "Manual Files":
+        branches = ss.gh.list_branches(repo)
+        if not branches:
+            st.warning("No branches found.")
+        else:
+            default_idx = branches.index(ss.manual_ref) if ss.manual_ref in branches else 0
+            manual_ref = st.selectbox("Branch/Ref", branches, index=default_idx)
+            ss.manual_ref = manual_ref
 
-can_run = (mode == "Pull Request" and pr is not None) or (mode == "Commit" and commit is not None)
+            if st.button("Load file list", key="load_manual_file_list"):
+                with st.status("Loading repository files", expanded=False) as status:
+                    status.write("Downloading source snapshot...")
+                    src = ss.gh.download_source(repo, manual_ref)
+                    files = _list_repo_files(src)
+                    ss.manual_repo_files = files
+                    ss.src_path = src
+                    ss.target_ref = manual_ref
+                    ss.manual_loaded_ref = manual_ref
+                    status.update(label=f"Loaded {len(files)} files", state="complete")
+
+            if ss.manual_loaded_ref and ss.manual_loaded_ref != manual_ref:
+                st.info("Branch/ref changed. Click 'Load file list' to refresh selectable files.")
+
+            if ss.manual_repo_files:
+                st.caption("Select files by folder")
+                selected_now: list[str] = []
+                grouped: dict[str, list[str]] = {}
+                for path in ss.manual_repo_files:
+                    parts = path.split("/", 1)
+                    folder = parts[0] if len(parts) > 1 else "(root)"
+                    grouped.setdefault(folder, []).append(path)
+
+                for folder in sorted(grouped.keys()):
+                    files = sorted(grouped[folder])
+                    with st.expander(f"{folder} ({len(files)})", expanded=False):
+                        all_key = f"manual_folder_all::{folder}"
+                        select_all = st.checkbox(
+                            f"Select all in {folder}",
+                            key=all_key,
+                            value=all(f in ss.manual_files for f in files),
+                        )
+                        for fpath in files:
+                            file_key = f"manual_file::{fpath}"
+                            if select_all:
+                                st.session_state[file_key] = True
+                            checked = st.checkbox(
+                                fpath.split("/", 1)[-1],
+                                key=file_key,
+                                value=fpath in ss.manual_files,
+                            )
+                            if checked:
+                                selected_now.append(fpath)
+
+                ss.manual_files = sorted(set(selected_now))
+            else:
+                st.caption("Load a branch/ref to pick files.")
+    else:
+        st.caption("Upload direct code files, a ZIP file, or both. Upload mode analyzes all discovered functions.")
+        uploaded_direct = st.file_uploader(
+            "Upload code files",
+            accept_multiple_files=True,
+            key="upload_direct_files",
+        )
+        uploaded_zip = st.file_uploader(
+            "Upload ZIP (optional)",
+            type=["zip"],
+            key="upload_zip_file",
+        )
+        if st.button("Prepare uploads", key="prepare_uploads"):
+            try:
+                with st.status("Preparing uploaded files", expanded=False) as status:
+                    direct_payload = [
+                        (f.name, f.getvalue())
+                        for f in (uploaded_direct or [])
+                    ]
+                    zip_blob = uploaded_zip.getvalue() if uploaded_zip else None
+                    if not direct_payload and not zip_blob:
+                        raise RuntimeError("Upload at least one direct file or one ZIP archive.")
+                    src, files = materialize_uploaded_sources(
+                        direct_payload,
+                        zip_blob,
+                        _DEFAULT_CODE_EXTS,
+                    )
+                    ss.upload_src_path = src
+                    ss.upload_files = files
+                    status.update(label=f"Prepared {len(files)} file(s)", state="complete")
+            except Exception as exc:
+                st.error(str(exc))
+        if ss.upload_files:
+            st.caption(f"Prepared {len(ss.upload_files)} file(s) for upload mode.")
+
+can_run = (
+    (mode == "Pull Request" and pr is not None)
+    or (mode == "Commit" and commit is not None)
+    or (mode == "Manual Files" and bool(ss.manual_files) and bool(ss.manual_ref))
+    or (mode == "Upload Files" and bool(ss.upload_files) and bool(ss.upload_src_path))
+)
 
 if st.button("Build Prompts", type="primary", disabled=not can_run):
     try:
@@ -163,7 +318,10 @@ if st.button("Build Prompts", type="primary", disabled=not can_run):
                 cg = build_graph(src, backend=ss.backend)
                 status.write("Fetching PR diff...")
                 raw = ss.gh.get_pr_diff(repo, pr.number)
-            else:
+                status.write("Building per-function prompts and chains...")
+                prompts = build_prompts_by_function(cg, src, raw, depth=depth)
+                chains = build_changed_file_chains(cg, raw, depth=depth)
+            elif mode == "Commit":
                 target_ref = commit.sha
                 target_repo = repo
                 status.write("Downloading commit source...")
@@ -172,23 +330,110 @@ if st.button("Build Prompts", type="primary", disabled=not can_run):
                 cg = build_graph(src, backend=ss.backend)
                 status.write("Fetching commit diff...")
                 raw = ss.gh.get_commit_diff(repo, commit.sha)
+                status.write("Building per-function prompts and chains...")
+                prompts = build_prompts_by_function(cg, src, raw, depth=depth)
+                chains = build_changed_file_chains(cg, raw, depth=depth)
+            elif mode == "Manual Files":
+                target_ref = ss.manual_ref
+                target_repo = repo
+                status.write("Preparing manual file selection source...")
+                if not ss.src_path or ss.manual_loaded_ref != target_ref:
+                    src = ss.gh.download_source(target_repo, target_ref)
+                    ss.src_path = src
+                    ss.manual_loaded_ref = target_ref
+                    ss.manual_repo_files = _list_repo_files(src)
+                else:
+                    src = ss.src_path
 
-            status.write("Building per-function prompts and chains...")
-            prompts = build_prompts_by_function(cg, src, raw, depth=depth)
-            chains = build_changed_file_chains(cg, raw, depth=depth)
+                selected = [f for f in ss.manual_files if f in set(ss.manual_repo_files)]
+                if not selected:
+                    raise RuntimeError("Manual mode requires at least one selected file.")
+
+                status.write("Building graph...")
+                cg = build_graph(src, backend=ss.backend)
+                status.write("Building per-function prompts and chains...")
+                prompts = build_prompts_for_selected_files(cg, src, selected, depth=depth)
+                chains = build_selected_file_chains(cg, selected, depth=depth)
+                raw = _manual_diff_overview(selected)
+                if not prompts:
+                    status.write("No prompts were generated from selected files.")
+            else:
+                target_ref = "uploaded-files"
+                target_repo = repo
+                status.write("Preparing uploaded source...")
+                src = ss.upload_src_path
+                selected = [f for f in ss.upload_files if f in set(_list_repo_files(src))]
+                if not selected:
+                    raise RuntimeError("Upload mode requires at least one supported selected file.")
+
+                status.write("Building graph...")
+                cg = build_graph(src, backend=ss.backend)
+                status.write("Building per-function prompts and chains...")
+                prompts = build_prompts_for_selected_files(cg, src, selected, depth=depth)
+                chains = build_selected_file_chains(cg, selected, depth=depth)
+                raw = _manual_diff_overview(selected)
+                if not prompts:
+                    status.write("No prompts were generated from uploaded files.")
 
             ss.src_path = src
             ss.diff_raw = raw
             ss.prompts = prompts
             ss.file_chains = chains
             ss.target_ref = target_ref
+            ss.review_mode = mode
+            if mode == "Manual Files":
+                prev_selected = dict(ss.manual_prompt_selected)
+                ss.manual_prompt_selected = {
+                    pid: bool(prev_selected.get(pid, True)) for pid in prompts.keys()
+                }
             if not prompts:
                 status.write("No prompts were generated from changed lines. Check diff overview and graph backend.")
             status.update(label="Prompt build complete", state="complete")
     except Exception as exc:
         st.error(str(exc))
 
-can_review = bool(ss.src_path and ss.diff_raw)
+manual_selected_prompt_ids: List[str] = []
+if ss.review_mode == "Manual Files" and ss.prompts:
+    st.subheader("Manual function selection")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Select all functions", key="manual_select_all_functions"):
+            for pid in ss.prompts.keys():
+                ss.manual_prompt_selected[pid] = True
+    with col2:
+        if st.button("Clear function selection", key="manual_clear_functions"):
+            for pid in ss.prompts.keys():
+                ss.manual_prompt_selected[pid] = False
+
+    for prompt_id in sorted(ss.prompts.keys()):
+        default_checked = bool(ss.manual_prompt_selected.get(prompt_id, True))
+        checked = st.checkbox(
+            prompt_id,
+            key=f"manual_prompt_select::{prompt_id}",
+            value=default_checked,
+        )
+        ss.manual_prompt_selected[prompt_id] = bool(checked)
+        if checked:
+            manual_selected_prompt_ids.append(prompt_id)
+
+    st.caption(f"Selected {len(manual_selected_prompt_ids)} of {len(ss.prompts)} functions for review.")
+elif ss.prompts:
+    manual_selected_prompt_ids = list(ss.prompts.keys())
+
+can_review = bool(ss.src_path) and (
+    (
+        ss.review_mode == "Manual Files"
+        and bool(ss.prompts)
+        and bool(ss.manual_files)
+        and bool(manual_selected_prompt_ids)
+    )
+    or (
+        ss.review_mode == "Upload Files"
+        and bool(ss.prompts)
+        and bool(ss.upload_files)
+    )
+    or (ss.review_mode != "Manual Files" and bool(ss.diff_raw))
+)
 if st.button("Run Review", disabled=not can_review):
     try:
         with st.status("Running two-agent Nova review", expanded=True) as status:
@@ -207,14 +452,51 @@ if st.button("Run Review", disabled=not can_review):
             )
 
             status.write("Running Agent 1 + Agent 2 in parallel...")
-            reviews = run_two_agent_review(
-                cg,
-                ss.src_path,
-                ss.diff_raw,
-                complete,
-                depth=depth,
-                max_workers=int(nova_workers),
-            )
+            if ss.review_mode == "Manual Files":
+                selected_prompt_ids = [
+                    pid for pid in manual_selected_prompt_ids if pid in ss.prompts
+                ]
+                prompt_subset = {pid: ss.prompts[pid] for pid in selected_prompt_ids}
+                chain_subset = {
+                    pid: ss.file_chains[pid]
+                    for pid in selected_prompt_ids
+                    if pid in ss.file_chains
+                }
+                reviews = run_two_agent_review_manual(
+                    cg,
+                    ss.src_path,
+                    ss.manual_files,
+                    prompt_subset,
+                    chain_subset,
+                    complete,
+                    max_workers=int(nova_workers),
+                )
+            elif ss.review_mode == "Upload Files":
+                selected_prompt_ids = sorted(ss.prompts.keys())
+                prompt_subset = {pid: ss.prompts[pid] for pid in selected_prompt_ids}
+                chain_subset = {
+                    pid: ss.file_chains[pid]
+                    for pid in selected_prompt_ids
+                    if pid in ss.file_chains
+                }
+                reviews = run_two_agent_review_manual(
+                    cg,
+                    ss.src_path,
+                    ss.upload_files,
+                    prompt_subset,
+                    chain_subset,
+                    complete,
+                    max_workers=int(nova_workers),
+                )
+            else:
+                reviews = run_two_agent_review(
+                    cg,
+                    ss.src_path,
+                    ss.diff_raw,
+                    complete,
+                    depth=depth,
+                    max_workers=int(nova_workers),
+                )
             ss.review_results = reviews
             status.update(label="Two-agent review complete", state="complete")
     except Exception as exc:

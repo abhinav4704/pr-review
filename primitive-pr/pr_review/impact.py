@@ -184,9 +184,40 @@ def _impactors(cg: CodeGraph, nid: str,
     return out
 
 
+def _same_class_prefixes(cluster: List[str]) -> Set[Tuple[str, str]]:
+    """Return (file_path, class_name) pairs for all cluster members inside a class.
+
+    Used by impact_tree to decide whether an unchanged same-class sibling (e.g.
+    Logger.info when Logger.emit is changed) should be walked through rather than
+    treated as a terminal consumer.  Only nodes whose qualname contains a dot are
+    considered (method/field inside a class).
+    """
+    out: Set[Tuple[str, str]] = set()
+    for nid in cluster:
+        if "::" not in nid:
+            continue
+        file_part, qualname = nid.split("::", 1)
+        if "." in qualname:
+            class_name = qualname.split(".")[0]
+            out.add((file_part, class_name))
+    return out
+
+
+def _in_same_class(nid: str, prefixes: Set[Tuple[str, str]]) -> bool:
+    """True when ``nid`` belongs to one of the (file, class) pairs in ``prefixes``."""
+    if "::" not in nid:
+        return False
+    file_part, qualname = nid.split("::", 1)
+    if "." not in qualname:
+        return False
+    class_name = qualname.split(".")[0]
+    return (file_part, class_name) in prefixes
+
+
 def impact_tree(cg: CodeGraph, cluster: List[str], changed: Set[str],
                 max_depth: int = DEFAULT_MAX_DEPTH,
-                exclude_ambiguous: bool = True
+                exclude_ambiguous: bool = True,
+                expand_same_class: bool = False,
                 ) -> Tuple[Dict[str, Tuple[str, str, str]], Dict[str, int], List[str]]:
     """Multi-source reverse-BFS from a whole cluster.
 
@@ -200,7 +231,17 @@ def impact_tree(cg: CodeGraph, cluster: List[str], changed: Set[str],
     "repeated outputs" of independent depth-N neighbour queries. We expand only
     CHANGED nodes (cluster members + changed intermediates); an unchanged node is
     terminal — it's a consumer, recorded but not walked past.
+
+    When ``expand_same_class=True``, unchanged nodes that belong to the same
+    class (same file + same top-level qualifier) as a cluster member are treated
+    as pass-through intermediates rather than terminals.  They are still recorded
+    as consumers (so they appear in chains), but the BFS continues through them,
+    surfacing the real external callers.  This is necessary for utility classes
+    like ``Logger`` where only one private method is changed but every public
+    wrapper (``info``, ``warn``, ``error``) is an unchanged sibling.
     """
+    same_class: Set[Tuple[str, str]] = _same_class_prefixes(cluster) if expand_same_class else set()
+
     parent: Dict[str, Tuple[str, str, str]] = {}
     depth: Dict[str, int] = {m: 0 for m in cluster}
     visited: Set[str] = set(cluster)
@@ -211,7 +252,10 @@ def impact_tree(cg: CodeGraph, cluster: List[str], changed: Set[str],
         cur = q.popleft()
         if depth[cur] >= max_depth:
             continue
-        if cur not in changed:
+        # Terminal check: an unchanged node is normally terminal unless it belongs
+        # to the same class as a cluster member (same-class passthrough).
+        is_passthrough = expand_same_class and _in_same_class(cur, same_class)
+        if cur not in changed and not is_passthrough:
             continue  # consumer reached earlier — terminal, don't expand
         for dep, etype, conf in _impactors(cg, cur, exclude_ambiguous):
             if dep in visited:
@@ -421,7 +465,8 @@ def analyze_impact(cg: CodeGraph, file_diffs: List[FileDiff],
                    max_consumers_per_cluster: int = DEFAULT_MAX_CONSUMERS,
                    exclude_ambiguous: bool = False,
                    gone: Optional[Set[str]] = None,
-                   consumer_src_fn: Optional[Callable[[ChainNode], str]] = None
+                   consumer_src_fn: Optional[Callable[[ChainNode], str]] = None,
+                   expand_same_class: bool = False,
                    ) -> ImpactResult:
     """Full pipeline: changed nodes -> clusters -> impact trees -> ranked chains.
 
@@ -433,6 +478,10 @@ def analyze_impact(cg: CodeGraph, file_diffs: List[FileDiff],
     ``gone`` (removed/renamed field names) + ``consumer_src_fn`` enable the
     data-flow signal: a consumer that still references a removed field is ranked
     higher and flagged on the chain (``Chain.field_hits``).
+
+    ``expand_same_class=True`` passes through unchanged same-class siblings
+    (e.g. Logger.info/warn/error when Logger.emit is changed) so external callers
+    appear in the impact chains rather than being hidden behind the terminal.
     """
     changed_nodes = map_changes(cg, file_diffs)
     changed: Set[str] = {c.node_id for c in changed_nodes}
@@ -443,7 +492,9 @@ def analyze_impact(cg: CodeGraph, file_diffs: List[FileDiff],
         member_set = set(members)
         parent, _depth, consumers = impact_tree(
             cg, members, changed, max_depth=max_depth,
-            exclude_ambiguous=exclude_ambiguous)
+            exclude_ambiguous=exclude_ambiguous,
+            expand_same_class=expand_same_class,
+        )
         chains = [
             _build_chain(cg, c, parent, changed, ctype, file_diffs,
                          gone=gone, consumer_src_fn=consumer_src_fn,

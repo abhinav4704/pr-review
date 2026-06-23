@@ -20,6 +20,7 @@ Oversized inputs are split into chunks and the findings merged.
 from __future__ import annotations
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,33 +86,49 @@ def _chunk(text: str, budget: int) -> List[str]:
 
 # ── system prompts ───────────────────────────────────────────────────────────
 WHOLE_FILE_SYSTEM = (
-    "You are reviewing one file in a pull request. You get the DIFF (what changed) and the "
-    "FULL FILE for context. Look only at what the diff changed and report: anything it breaks, "
-    "bugs it adds, security problems (an exposed secret or key is critical; an open hole like "
-    "SQL injection, unchecked input, or missing auth is high or medium), slow code, and "
-    "optional improvements. Read the full file to be sure, but do not report old problems that "
-    "are not related to this change.\n\n" + FINDINGS_SCHEMA
+    "You are AGENT 1 — the changed-file reviewer. Your only job is to analyse the file that "
+    "was changed in this PR.\n"
+    "You receive: the DIFF (lines that changed) and the FULL FILE for context.\n\n"
+    "YOUR SCOPE — report only:\n"
+    "- Bugs introduced by the diff (logic errors, null dereferences, wrong conditions).\n"
+    "- Security problems in the changed code (exposed secrets = critical; SQL injection, "
+    "unchecked input, missing auth = high/medium).\n"
+    "- Performance problems added by the diff.\n"
+    "- Improvements to the changed lines only.\n\n"
+    "OUT OF SCOPE — do NOT report:\n"
+    "- Whether any OTHER file or caller breaks because of this change. That is Agent 2's job.\n"
+    "- Problems that existed before this diff and are unrelated to the changed lines.\n"
+    "- Any finding whose 'file' field is not the file you are reviewing right now.\n\n"
+    "Read the full file only to understand context. All findings must cite lines inside "
+    "this file.\n\n" + FINDINGS_SCHEMA
 )
 
 IMPACT_CHAIN_SYSTEM = (
     "You are checking what a code change might break. You are given three things:\n"
     "1. The CHANGED FUNCTIONS (where the change starts). Every line has a number on the left; "
     "lines marked '>' are the ones that changed.\n"
-    "2. CHAINS that show how the change reaches other code: `source -> middle -> consumer`.\n"
-    "3. The full code of each CONSUMER at the end of a chain, also with line numbers. These "
-    "consumers were NOT changed in this PR.\n\n"
-    "For each chain, ask one question: does the change actually break this consumer? It breaks "
-    "the consumer if the consumer still depends on something the change altered — for example a "
+    "2. CHAINS showing which CALLERS depend on the changed code. Format: "
+    "`changed_function → ... → caller`. The arrow means 'is called by' — the leftmost entry "
+    "is the changed function; the rightmost entry is the CALLER (consumer). "
+    "The actual call direction in the code is REVERSED: caller → changed_function. "
+    "Do NOT interpret the arrow as showing that the changed function calls the consumer.\n"
+    "3. The full code of each CALLER (consumer) at the end of a chain, with line numbers. "
+    "These callers were NOT changed in this PR.\n\n"
+    "For each chain, ask one question: does the change actually break this caller? It breaks "
+    "the caller if it still depends on something the change altered — for example a "
     "renamed or removed field, a different return value or type, changed arguments, or a new "
     "error. If it breaks, report category 'breaking' (critical) and:\n"
-    "- set \"file\" to the CONSUMER's file and \"line\" to the exact line in that consumer that "
+    "- set \"file\" to the CALLER's file and \"line\" to the exact line in that caller that "
     "breaks (use the line numbers shown in the left margin — do not guess).\n"
     "- put the broken line of code in \"evidence\".\n"
     "- in \"explanation\", name the cause: which changed function (and its file) broke it, e.g. "
     "'make_user (schema.py) renamed age->years, so show (app.py:5) still reads p[\"age\"] and "
     "will crash'.\n"
-    "If the chain exists but the consumer does not actually use what changed, do not report it. "
-    "Only report problems caused by the change.\n\n" + FINDINGS_SCHEMA
+    "If the chain exists but the caller does not actually use what changed, do not report it. "
+    "Only report problems caused by the change.\n"
+    "IMPORTANT: Set 'file' and 'line' to the exact file path and line number shown in the "
+    "caller source header in section 3. Do not invent class names or method calls that are "
+    "not visible in the source listing shown to you.\n\n" + FINDINGS_SCHEMA
 )
 
 VERIFY_SYSTEM = (
@@ -180,6 +197,17 @@ def _run_chunked(system: str, user: str, file_path: str,
 def review_file(src_path: str, file_diff, complete: CompleteFn,
                 budget: int = DEFAULT_BUDGET, diff_text: str = "") -> List[Finding]:
     findings = pass_whole_file(file_diff.path, src_path, complete, budget, diff_text=diff_text)
+    # Keep only findings whose reported file matches the reviewed file.  The LLM
+    # has no visibility into other files in whole-file mode, so any cross-file
+    # finding is a hallucination (e.g. referencing a method it never saw).
+    reviewed = file_diff.path.replace("\\", "/")
+    reviewed_base = os.path.basename(reviewed)
+    def _in_file(f: Finding) -> bool:
+        fp = (f.file or "").replace("\\", "/")
+        if not fp:
+            return True
+        return fp == reviewed or fp.endswith("/" + reviewed) or os.path.basename(fp) == reviewed_base
+    findings = [f for f in findings if _in_file(f)]
     return sort_by_severity(dedupe(findings))
 
 
@@ -280,7 +308,7 @@ def _cluster_dossier(cg, src_path: str, cluster: Cluster, file_diffs,
                      f"```\n{src}\n```\n")
 
     # 2. the deterministic propagation chains (already ranked, capped)
-    parts.append("## Propagation chains (source → … → UNCHANGED consumer)\n")
+    parts.append("## Propagation chains (changed code → … → CALLER) — arrow = 'is called by'\n")
     shown = cluster.chains[:MAX_CONSUMERS_IN_DOSSIER]
     for i, ch in enumerate(shown, 1):
         flag = f"   ⚠ still uses removed/renamed field(s): {', '.join(ch.field_hits)}" \
@@ -408,7 +436,8 @@ def review_pr_impact(cg, src_path: str, file_diffs, complete: CompleteFn,
 
     result: ImpactResult = analyze_impact(
         cg, file_diffs, max_depth=max_depth,
-        gone=gone, consumer_src_fn=_consumer_src)
+        gone=gone, consumer_src_fn=_consumer_src,
+        expand_same_class=True)
 
     actionable = [c for c in result.clusters if c.chains]
     total = len(actionable)

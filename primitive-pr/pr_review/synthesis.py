@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from .findings import Finding, SEVERITY_ORDER, SEVERITY_WEIGHT, sort_by_severity
+from .findings import Finding, SEVERITY_ORDER, SEVERITY_WEIGHT, sort_by_severity, dedupe_cross_track
 from .impact import Cluster, chain_to_text, chain_locations
 from .pr_passes import ClusterReview
 
@@ -70,9 +70,15 @@ SYNTHESIZER_SYSTEM = (
     "  1. State the root cause (the changed line that introduces the problem).\n"
     "  2. Cite changed code (file + line).\n"
     "  3. Explain exploitability (who triggers it and how).\n"
-    "  4. Incorporate the blast radius from the impact chains.\n"
+    "  4. Incorporate the FULL blast radius: enumerate ALL affected callers from the "
+    "     propagation chains — do not cite only one example. If 9 callers are shown in "
+    "     the chains, state all 9 are affected and list them.\n"
     "  5. Give a concrete recommendation.\n\n"
-    "Do NOT produce one paragraph per finding. Merge findings that share a root cause.\n\n"
+    "Do NOT produce one paragraph per finding. When a Track A finding identifies a bug at "
+    "its source AND a Track B finding reports a broken call site that exercises that same "
+    "bug (matching title or description), consolidate them into ONE finding: cite the root "
+    "cause file+line (Track A), then list every affected caller from the impact chains as "
+    "the blast radius. Do not report the same root-cause bug once per call site.\n\n"
     + ISSUE_SCHEMA
 )
 
@@ -344,7 +350,19 @@ def synthesize_cluster(
     if not matched and not cluster_review.findings and not cluster.chains:
         return []
 
-    dossier = _build_synthesis_dossier(cg, cluster_review, matched, diff_by_file)
+    # Deduplicate across tracks so the same bug (e.g. a println) does not appear
+    # twice in the synthesizer prompt with different severities.
+    all_input_findings = dedupe_cross_track(sort_by_severity(matched + cluster_review.findings))
+    # Re-partition into matched (Track A) and impact (Track B) for dossier layout.
+    matched_ids = {id(f) for f in matched}
+    b_ids = {id(f) for f in cluster_review.findings}
+    # Use cross-track deduped list for the dossier; preserve partition semantics.
+    deduped_matched = [f for f in all_input_findings if id(f) in matched_ids or id(f) not in b_ids]
+    deduped_b_findings = [f for f in all_input_findings if id(f) in b_ids or id(f) not in matched_ids]
+    # Build a temporary cluster_review view with deduped Track B findings.
+    _cr = ClusterReview(cluster=cluster_review.cluster, findings=deduped_b_findings)
+
+    dossier = _build_synthesis_dossier(cg, _cr, deduped_matched, diff_by_file)
 
     # Trim to budget (keep the synthesis input whole — no chunking; the dossier
     # is already much smaller than the full cluster dossier in pr_passes)
@@ -352,7 +370,7 @@ def synthesize_cluster(
         dossier = dossier[:budget] + "\n…(dossier trimmed to budget)…"
 
     raw = complete(SYNTHESIZER_SYSTEM, dossier)
-    all_source = sort_by_severity(matched + cluster_review.findings)
+    all_source = sort_by_severity(all_input_findings)
     reports = _parse_issue_reports(raw, cluster_idx=cluster_idx, source_findings=all_source)
     ids = sorted({finding_id(f) for f in all_source})
     evidence = _evidence_by_file(all_source)
