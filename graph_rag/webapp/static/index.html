@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codebase Brain — browser</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#272b34; --fg:#d6dae0;
+          --mut:#8a93a3; --acc:#5aa6ff; --ok:#46c08a; --warn:#e0a458; --amb:#e06a6a; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; gap:12px; align-items:center; padding:10px 14px;
+           border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .grow { flex:1; }
+  select, input, button { background:#0c0e12; color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:6px 9px; font:inherit; }
+  button { cursor:pointer; } button:hover { border-color:var(--acc); }
+  button.primary { background:var(--acc); color:#04101f; border-color:var(--acc); font-weight:600; }
+  main { display:grid; grid-template-columns:380px 1fr; height:calc(100vh - 53px); }
+  #left { border-right:1px solid var(--line); display:flex; flex-direction:column; min-height:0; }
+  #controls { padding:10px; display:flex; gap:8px; border-bottom:1px solid var(--line); }
+  #controls input { flex:1; }
+  #results { overflow:auto; }
+  .row { padding:7px 12px; border-bottom:1px solid #1d212a; cursor:pointer; }
+  .row:hover { background:#1b1f28; } .row.sel { background:#1f2733; }
+  .row .nm { font-weight:600; } .row .meta { color:var(--mut); font-size:12px; }
+  .tag { font-size:11px; padding:1px 6px; border-radius:10px; border:1px solid var(--line); color:var(--mut); }
+  .tag.Function { color:#7fb4ff; border-color:#274056; }
+  .tag.Class { color:#c79bff; border-color:#3a2c52; }
+  #detail { overflow:auto; padding:16px 20px; min-height:0; }
+  #detail h2 { margin:0 0 2px; font-size:18px; }
+  .sub { color:var(--mut); margin-bottom:14px; word-break:break-all; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:6px 16px; margin:10px 0 18px; }
+  .kv { font-size:12px; } .kv b { color:var(--mut); font-weight:500; display:block; }
+  .sect { margin:18px 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); }
+  .dep { padding:5px 8px; border:1px solid var(--line); border-radius:6px; margin:4px 0;
+         display:flex; gap:8px; align-items:center; cursor:pointer; }
+  .dep:hover { border-color:var(--acc); }
+  .dep .rel { font-size:11px; color:var(--acc); min-width:96px; }
+  .dep .ev { margin-left:auto; color:var(--mut); font-size:11px; }
+  .c-EXTRACTED { color:var(--ok); } .c-INFERRED { color:var(--warn); } .c-AMBIGUOUS { color:var(--amb); }
+  pre { background:#0a0c10; border:1px solid var(--line); border-radius:8px; padding:12px;
+        overflow:auto; font:12.5px/1.55 ui-monospace,Menlo,monospace; }
+  dialog { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:10px; width:460px; }
+  dialog h3 { margin:0 0 12px; } .field { margin:10px 0; } .field label { display:block; color:var(--mut); font-size:12px; margin-bottom:4px; }
+  .field input { width:100%; } .muted { color:var(--mut); } .hint { font-size:12px; color:var(--mut); margin:14px 0; }
+  #status { font-size:12px; color:var(--mut); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧠 Codebase Brain</h1>
+  <select id="repo" onchange="loadRepo()"></select>
+  <button onclick="dlg.showModal()">+ Add repo</button>
+  <span class="grow"></span>
+  <span id="status"></span>
+</header>
+
+<main>
+  <div id="left">
+    <div id="controls">
+      <input id="search" placeholder="search functions / classes…" oninput="debouncedSearch()">
+      <select id="label" onchange="search()">
+        <option value="">fn + class</option>
+        <option value="Function">functions</option>
+        <option value="Class">classes</option>
+        <option value="File">files</option>
+        <option value="Field">fields</option>
+      </select>
+    </div>
+    <div id="results"></div>
+  </div>
+  <div id="detail"><p class="muted">Pick a repo, then select a function or class.</p></div>
+</main>
+
+<dialog id="dlg">
+  <h3>Add a repository</h3>
+  <div class="field">
+    <label>GitHub URL</label>
+    <input id="ghurl" placeholder="https://github.com/owner/repo">
+  </div>
+  <div class="field">
+    <label>Name (optional)</label>
+    <input id="ghname" placeholder="auto from URL / filename">
+  </div>
+  <button class="primary" onclick="addGithub()">Clone & index</button>
+  <div class="hint">— or —</div>
+  <div class="field">
+    <label>Upload a .zip of the repo</label>
+    <input id="zip" type="file" accept=".zip">
+  </div>
+  <button class="primary" onclick="addUpload()">Upload & index</button>
+  <div style="text-align:right;margin-top:14px"><button onclick="dlg.close()">Close</button></div>
+  <div id="dlgmsg" class="hint"></div>
+</dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+const dlg = $('#dlg');
+let sel = null;
+
+async function api(path, opts) {
+  const r = await fetch('/api' + path, opts);
+  if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || r.statusText);
+  return r.json();
+}
+
+async function loadRepos(select) {
+  const repos = await api('/repos');
+  const el = $('#repo');
+  el.innerHTML = repos.map(r =>
+    `<option value="${r.name}">${r.name} (${r.nodes})${r.has_source?'':' ⚠ no source'}</option>`).join('');
+  if (repos.length) { if (select) el.value = select; loadRepo(); }
+  else $('#detail').innerHTML = '<p class="muted">No repos yet. Click “+ Add repo”.</p>';
+}
+
+function loadRepo() { search(); $('#detail').innerHTML = '<p class="muted">Select a function or class.</p>'; }
+
+let t; function debouncedSearch(){ clearTimeout(t); t=setTimeout(search,180); }
+
+async function search() {
+  const repo = $('#repo').value; if (!repo) return;
+  const rows = await api(`/nodes?repo=${encodeURIComponent(repo)}&query=${encodeURIComponent($('#search').value)}&label=${$('#label').value}`);
+  $('#results').innerHTML = rows.map(r => `
+    <div class="row" data-id="${r.id}" onclick="open_('${r.id}', this)">
+      <div><span class="nm">${r.name}</span> <span class="tag ${r.label}">${r.kind||r.label}</span></div>
+      <div class="meta">${r.file||''}${r.line?':'+r.line:''}</div>
+    </div>`).join('') || '<p class="muted" style="padding:12px">no matches</p>';
+}
+
+function depRow(d) {
+  return `<div class="dep" onclick="open_('${d.id}')">
+    <span class="rel">${d.rel}</span>
+    <span class="tag ${d.label}">${d.name}</span>
+    <span class="c-${d.confidence||'EXTRACTED'}">${(d.confidence||'').slice(0,3)}</span>
+    <span class="ev">${d.ef?d.ef.split('/').pop()+':'+(d.el||''):''} · ${d.extractor||''}</span>
+  </div>`;
+}
+
+async function open_(id, rowEl) {
+  document.querySelectorAll('.row.sel').forEach(e=>e.classList.remove('sel'));
+  if (rowEl) rowEl.classList.add('sel');
+  else { const r=document.querySelector(`.row[data-id="${id}"]`); if(r)r.classList.add('sel'); }
+  const d = await api('/nodes/' + id);
+  const n = d.node;
+  const kv = (k,v) => v!==undefined && v!==null && v!=='' ? `<div class="kv"><b>${k}</b>${v}</div>` : '';
+  const mods = (n.modifiers||[]).join(', ');
+  $('#detail').innerHTML = `
+    <h2>${n.name} <span class="tag ${n.label}">${n.kind||n.label}</span></h2>
+    <div class="sub">${n.fqn||''}</div>
+    <div class="grid">
+      ${kv('file', (n.file||'')+(n.start_line?(':'+n.start_line+'–'+(n.end_line||'')):''))}
+      ${kv('language', n.lang)} ${kv('visibility', n.visibility)}
+      ${kv('returns', n.return_type)} ${kv('params', n.param_count)}
+      ${kv('modifiers', mods)} ${kv('static', n.is_static)} ${kv('async', n.is_async)}
+      ${kv('abstract', n.is_abstract)} ${kv('signature', n.signature)}
+      ${kv('confidence', n.confidence)} ${kv('extractor', n.extractor)}
+    </div>
+    ${n.docstring?`<div class="sect">docstring</div><div class="muted">${escapeHtml(n.docstring)}</div>`:''}
+    <div class="sect">dependencies → (${d.outgoing.length})</div>
+    ${d.outgoing.map(depRow).join('') || '<div class="muted">none</div>'}
+    <div class="sect">← used by (${d.incoming.length})</div>
+    ${d.incoming.map(depRow).join('') || '<div class="muted">none</div>'}
+    <div class="sect">source</div>
+    <pre>${d.source?escapeHtml(d.source):'<span class="muted">source unavailable (repo path not registered)</span>'}</pre>
+  `;
+  $('#detail').scrollTop = 0;
+}
+
+function escapeHtml(s){ return s.replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+async function addGithub() {
+  const fd = new FormData();
+  fd.append('url', $('#ghurl').value); fd.append('name', $('#ghname').value);
+  await runAdd('/repos/github', fd, $('#ghname').value || $('#ghurl').value);
+}
+async function addUpload() {
+  const f = $('#zip').files[0]; if(!f){ $('#dlgmsg').textContent='pick a .zip first'; return; }
+  const fd = new FormData(); fd.append('file', f); fd.append('name', $('#ghname').value);
+  await runAdd('/repos/upload', fd, f.name);
+}
+async function runAdd(path, fd, label) {
+  $('#dlgmsg').textContent = 'indexing ' + label + ' … (clone + parse + resolve)';
+  try {
+    const res = await api(path, {method:'POST', body:fd});
+    $('#dlgmsg').textContent = `done: ${res.files} files, ${res.nodes} nodes, ${res.edges} edges`;
+    await loadRepos(res.repo); setTimeout(()=>dlg.close(), 900);
+  } catch(e) { $('#dlgmsg').textContent = 'error: ' + e.message; }
+}
+
+loadRepos();
+</script>
+</body>
+</html>
