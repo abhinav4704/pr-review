@@ -62,11 +62,15 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
             parent_of[e.dst] = e.src
 
     methods_of_class: dict[str, dict[str, list[Node]]] = defaultdict(lambda: defaultdict(list))
+    fields_of_class: dict[str, dict[str, list[Node]]] = defaultdict(lambda: defaultdict(list))
     for n in nodes:
+        p = parent_of.get(n.id)
+        if not (p and nodes_by_id.get(p) and nodes_by_id[p].label == "Class"):
+            continue
         if n.label == "Function" and n.kind == "method":
-            p = parent_of.get(n.id)
-            if p and nodes_by_id.get(p) and nodes_by_id[p].label == "Class":
-                methods_of_class[p][n.name].append(n)
+            methods_of_class[p][n.name].append(n)
+        elif n.label == "Field":
+            fields_of_class[p][n.name].append(n)
 
     def enclosing_class_id(node_id: str) -> str | None:
         cur = parent_of.get(node_id)
@@ -162,6 +166,13 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
         if ref.type == "CALLS":
             emit(ref, cov, narrow_call(ref), Confidence.INFERRED.value,
                  known_in_repo=ref.target_name in by_name)
+            continue
+
+        if ref.type in ("READS", "WRITES"):
+            # self.<field> resolved to the enclosing class's field — scope-exact.
+            cid = enclosing_class_id(ref.src)
+            wanted = fields_of_class[cid].get(ref.target_name, []) if cid else []
+            emit(ref, cov, wanted, Confidence.EXTRACTED.value, known_in_repo=bool(wanted))
             continue
 
         candidates = by_name.get(ref.target_name, [])

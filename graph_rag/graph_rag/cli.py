@@ -26,8 +26,8 @@ def _cmd_index(args) -> int:
     print(f"  in db:  {res.db_counts}")
     sc = res.scip
     if sc.available:
-        print(f"\n  CALLS (python): EXTRACTED via {sc.tool} — {sc.calls} edges "
-              f"({sc.mapped_defs}/{sc.inrepo_defs} symbols mapped)")
+        print(f"\n  SCIP ({sc.tool}): CALLS={sc.calls} OVERRIDES={sc.overrides} "
+              f"EXTRACTED ({sc.mapped_defs}/{sc.inrepo_defs} symbols mapped)")
     print("\n  resolution coverage (heuristic name match; % = of in-repo targets):")
     for rtype, cov in sorted(res.coverage.items()):
         print(

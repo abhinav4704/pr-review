@@ -31,6 +31,12 @@ EDGE_TYPES = {
     "OF_TYPE",      # Field -> Class (declared type)
     "HAS_TYPE",     # Function -> Class (a parameter's type)
     "HAS_GENERIC",  # carrier -> Class (a generic type argument, e.g. List[User])
+    # Milestone 4 — program relationships
+    "OVERRIDES",    # Function -> Function (overrides/implements a base method) [SCIP]
+    "READS",        # Function -> Field (reads instance/class state)
+    "WRITES",       # Function -> Field (mutates instance/class state)
+    "THROWS",       # Function -> Class (raises an exception type)
+    "CATCHES",      # Function -> Class (catches an exception type)
 }
 
 

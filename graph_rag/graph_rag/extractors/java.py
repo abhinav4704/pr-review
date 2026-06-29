@@ -52,9 +52,9 @@ def extract(file: FileInfo, repo: str):
             evidence_col=child_node.start_point[1],
         ))
 
-    def ref(rtype, src_id, target, kind_hint, node):
+    def ref(rtype, src_id, target, kind_hint, node, recv=""):
         refs.append(RawRef(
-            rtype, src_id, target, kind_hint,
+            rtype, src_id, target, kind_hint, recv=recv,
             ref_file=file.relpath,
             ref_line=node.start_point[0] + 1, ref_col=node.start_point[1],
         ))
@@ -172,8 +172,21 @@ def extract(file: FileInfo, repo: str):
                     if t is not None:
                         _emit_type(ref, "HAS_TYPE", mid, src, t)
 
+        # checked exceptions declared in the `throws` clause
+        for c in node.children:
+            if c.type == "throws":
+                for t in _types_in(src, c):
+                    ref("THROWS", mid, t, "type", c)
+
         body = node.child_by_field_name("body")
         if body:
+            # field-writes: `this.x = ...` (LHS of an assignment)
+            write_fa = set()
+            for d in iter_descendants(body):
+                if d.type == "assignment_expression":
+                    left = d.child_by_field_name("left")
+                    if left is not None and _this_field(src, left):
+                        write_fa.add(left.id)   # stable tree-sitter node id
             for d in iter_descendants(body):
                 if d.type == "method_invocation":
                     nm = d.child_by_field_name("name")
@@ -183,6 +196,17 @@ def extract(file: FileInfo, repo: str):
                     tp = d.child_by_field_name("type")
                     if tp:
                         ref("INSTANTIATES", mid, simple_type_name(text(src, tp)), "type", d)
+                elif d.type == "throw_statement":
+                    for t in _thrown_types(src, d):
+                        ref("THROWS", mid, t, "type", d)
+                elif d.type == "catch_formal_parameter":
+                    for t in _types_in(src, d):
+                        ref("CATCHES", mid, t, "type", d)
+                elif d.type == "field_access":
+                    fname = _this_field(src, d)
+                    if fname:
+                        ref("WRITES" if d.id in write_fa else "READS",
+                            mid, fname, "field", d, recv="this")
 
     def walk_field(node, class_fqn, class_id):
         vis, mods, _ = modifiers_of(node)
@@ -242,6 +266,30 @@ def _java_type_parts(src: bytes, node):
                     if nm and nm not in args:
                         args.append(nm)
     return base, args
+
+
+def _this_field(src: bytes, fa) -> str:
+    """If `fa` is `this.<x>`, return 'x'; else ''."""
+    if fa.type != "field_access":
+        return ""
+    obj = fa.child_by_field_name("object")
+    if obj is None or obj.type != "this":
+        return ""
+    f = fa.child_by_field_name("field")
+    return text(src, f) if f else ""
+
+
+def _thrown_types(src: bytes, throw_node):
+    """Exception type names from `throw new X(...)` (rethrown vars are skipped)."""
+    out = []
+    for d in [throw_node, *iter_descendants(throw_node)]:
+        if d.type == "object_creation_expression":
+            tp = d.child_by_field_name("type")
+            if tp is not None:
+                nm = simple_type_name(text(src, tp))
+                if nm:
+                    out.append(nm)
+    return out
 
 
 def _param_count(params_node) -> int:

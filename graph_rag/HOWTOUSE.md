@@ -120,6 +120,24 @@ MATCH (u)-[r:RETURNS|OF_TYPE|HAS_TYPE|HAS_GENERIC]->(t:Class {repo:'primitive-pr
 RETURN u.fqn, type(r), r.evidence_file, r.evidence_line;
 ```
 
+**State impact — who reads/writes a field**
+```cypher
+MATCH (fn)-[r:READS|WRITES]->(f:Field {repo:'primitive-pr', name:'balance'})
+RETURN fn.fqn, type(r);
+```
+
+**What overrides a method?** (precise, from SCIP)
+```cypher
+MATCH (sub)-[:OVERRIDES]->(base:Function {repo:'primitive-pr'})
+RETURN base.fqn AS base, collect(sub.fqn) AS overriders;
+```
+
+**Exception flow**
+```cypher
+MATCH (fn)-[r:THROWS|CATCHES]->(ex:Class {repo:'primitive-pr'})
+RETURN fn.fqn, type(r), ex.name;
+```
+
 **Class hierarchy**
 ```cypher
 MATCH (c:Class {repo:'primitive-pr'})-[:EXTENDS|IMPLEMENTS]->(parent)

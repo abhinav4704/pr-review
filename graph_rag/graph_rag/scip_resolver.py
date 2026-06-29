@@ -46,6 +46,7 @@ class ScipReport:
     inrepo_defs: int = 0              # in-repo symbols with a definition
     mapped_defs: int = 0             # ... that matched one of our nodes
     calls: int = 0                    # distinct CALLS edges emitted
+    overrides: int = 0                # distinct OVERRIDES edges emitted
 
 
 def run_scip_python(repo_root: str, project_name: str, out_path: str) -> str | None:
@@ -75,8 +76,8 @@ def _is_inrepo(symbol: str, project_name: str) -> bool:
     return len(parts) >= 5 and parts[2] == project_name
 
 
-def resolve_calls(nodes: list[Node], index_path: str, project_name: str):
-    """Parse a SCIP index -> (CALLS edges at EXTRACTED confidence, ScipReport)."""
+def resolve_edges(nodes: list[Node], index_path: str, project_name: str):
+    """Parse a SCIP index -> (EXTRACTED edges [CALLS + OVERRIDES], ScipReport)."""
     from .scip import scip_pb2  # lazy: requires the `protobuf` runtime
 
     index = scip_pb2.Index()
@@ -146,6 +147,27 @@ def resolve_calls(nodes: list[Node], index_path: str, project_name: str):
         for (s, d), ev in calls.items()
     ]
     report.calls = len(edges)
+
+    # 3. OVERRIDES — a method's SymbolInformation lists the base methods it
+    #    implements/overrides (Relationship.is_implementation). Both must be in-repo.
+    overrides: dict[tuple[str, str], Node] = {}
+    for doc in index.documents:
+        for si in doc.symbols:
+            src_node = sym_to_node.get(si.symbol)
+            if src_node is None or src_node.label != "Function":
+                continue
+            for rel in si.relationships:
+                if not rel.is_implementation:
+                    continue
+                tgt = sym_to_node.get(rel.symbol)
+                if tgt is not None and tgt.label == "Function" and tgt.id != src_node.id:
+                    overrides.setdefault((src_node.id, tgt.id), src_node)
+    for (s, d), sn in overrides.items():
+        edges.append(Edge(
+            "OVERRIDES", s, d, Confidence.EXTRACTED.value,
+            origin=Origin.EXTRACTED.value, extractor="scip-python",
+            evidence_file=sn.file, evidence_line=sn.start_line, evidence_col=sn.start_col))
+    report.overrides = len(overrides)
     return edges, report
 
 
@@ -165,7 +187,7 @@ def scip_resolve(nodes: list[Node], repo_root: str, project_name: str,
             index_path = run_scip_python(repo_root, project_name, tmp.name)
             if index_path is None:
                 return [], ScipReport(available=False)
-        return resolve_calls(nodes, index_path, project_name)
+        return resolve_edges(nodes, index_path, project_name)
     finally:
         if tmp is not None and os.path.exists(tmp.name):
             os.unlink(tmp.name)

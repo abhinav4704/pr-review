@@ -93,14 +93,19 @@ changes `body_hash` but keeps `id` (future incremental re-index patches in place
 `repo` is on every node → **multiple repos coexist** in one DB (e.g. `demo-java` +
 `primitive-pr`); `wipe` is repo-scoped.
 
-**Edge types** (allowlisted): `CONTAINS`, `IMPORTS`, `CALLS`, `INSTANTIATES`, `EXTENDS`,
-`IMPLEMENTS`, `ANNOTATED_WITH`.
+**Edge types** (allowlisted): structure `CONTAINS`, `IMPORTS` · refs `CALLS`,
+`INSTANTIATES`, `EXTENDS`, `IMPLEMENTS`, `ANNOTATED_WITH` · types (M2) `RETURNS`,
+`OF_TYPE`, `HAS_TYPE`, `HAS_GENERIC` · relationships (M4) `OVERRIDES`, `READS`, `WRITES`,
+`THROWS`, `CATCHES`.
 ```
-File  ─CONTAINS→  Class / Function / Field        Function ─CALLS→ Function (EXTRACTED via SCIP, Py)
-Class ─CONTAINS→  Function / Field / nested Class  Function ─INSTANTIATES→ Class
-Class ─EXTENDS→   Class                            File ─IMPORTS→ Class (in-repo only)
-Class ─IMPLEMENTS→ Class (Java)                    Class/Function ─ANNOTATED_WITH→ Annotation
+File  ─CONTAINS→  Class / Function / Field      Function ─CALLS→ Function (EXTRACTED via SCIP, Py)
+Class ─CONTAINS→  Function / Field / Class       Function ─OVERRIDES→ Function (SCIP, Py)
+Class ─EXTENDS/IMPLEMENTS→ Class                 Function ─RETURNS/HAS_TYPE/HAS_GENERIC→ Class
+Function ─READS/WRITES→ Field (self/this)        Field ─OF_TYPE→ Class
+Function ─THROWS/CATCHES→ Class (exception)      Class/Function ─ANNOTATED_WITH→ Annotation
 ```
+Python **instance fields** (`self.x = …`) are modeled as Field nodes so READS/WRITES have
+targets.
 **Edge properties:** `confidence` (EXTRACTED|INFERRED|AMBIGUOUS) · `origin`
 (EXTRACTED|DERIVED — orthogonal to confidence) · `extractor` (tree-sitter|scip-python|
 heuristic) · `evidence_file`/`evidence_line`/`evidence_col` (where the evidence lives).
@@ -154,7 +159,9 @@ Pipeline: `discover → tree-sitter extract (Java + Python) → heuristic name-r
   - `ids.py`, `models.py`, `schema.py`, `config.py` — stable IDs, data model, allowlists, env config
 - **Nodes:** File, Class (class/interface/enum/record), Function (method/constructor/function), Field, Annotation. Stable `id = hash(repo+kind+fqn)` + shared `:CodeNode` label.
 - **Edges:** CONTAINS, IMPORTS, CALLS, INSTANTIATES, EXTENDS, IMPLEMENTS, ANNOTATED_WITH — each tagged `confidence` (EXTRACTED|INFERRED|AMBIGUOUS).
-- **Verified:** `demo-java` sample + `primitive-pr` (13 py files → 352 nodes / 741 rels in ~0.7s). Live Cypher confirmed containment, class hierarchy, and blast-radius (transitive callers).
+- **Verified:** `demo-java` sample + `primitive-pr`. Latest full index (with M1–M4):
+  24 files → **522 nodes / 1252 rels** in ~2.9s. Live Cypher confirmed containment, class
+  hierarchy, blast-radius, type-usage, state-impact (READS/WRITES), and overrides.
 
 ### Environment (already set up)
 - venv at `graph_rag/.venv` with tree-sitter 0.25, tree-sitter-java/python, neo4j 6.2,
@@ -378,6 +385,31 @@ then in Neo4j: `MATCH ()-[r:CALLS]->() RETURN r.extractor, r.origin, count(*)`.
 
 ---
 
+## 🛠 CHANGELOG — M3 (symbol resolution) + M4 (program relationships)
+
+> The graph now understands **state** (READS/WRITES), **overrides**, and **exception flow**.
+
+- **OVERRIDES (SCIP, EXTRACTED)** — `scip_resolver.resolve_edges` now also reads each
+  method's `SymbolInformation.relationships` and emits `OVERRIDES` (subclass→base) when both
+  are in-repo. Verified: `_JavaExtractor._call_name → _GenericExtractor._call_name`, etc.
+- **READS / WRITES (AST, EXTRACTED)** — extractors detect `self.<f>`/`this.<f>` access;
+  writes = assignment targets, everything else = read. Resolved to the **enclosing class's
+  Field** (new `fields_of_class` map + `READS/WRITES` branch in the resolver). Python
+  **instance fields** (`self.x = …` in methods) are now materialized as Field nodes (deduped
+  via `created_fields`), so state edges have real targets.
+- **THROWS / CATCHES (AST)** — `raise`/`throw new`/Java `throws` clause → `THROWS`;
+  `except`/`catch` → `CATCHES`; resolved to in-repo exception Classes (external excluded).
+- **Bug fixed:** used builtin `id()` to mark assignment targets — tree-sitter returns fresh
+  Node wrappers per traversal, so it mis-classified writes as reads (Java showed 0 WRITES;
+  Python double-counted). Switched to the stable **`node.id`**.
+- **CLI**: SCIP line now shows `CALLS=… OVERRIDES=…`.
+- Result on `primitive-pr`: 522 nodes / 1252 rels; READS 179, WRITES 34, OVERRIDES 4,
+  THROWS 2. Query "who writes field X" and "what overrides Y" both work.
+- **M3 remainder is blocked** (scip-java needs maven/gradle) or deferred (SCIP-precise
+  types — low ROI; type edges already work as INFERRED).
+
+---
+
 ## 🔜 ROADMAP (LOCKED — stop redesigning, execute)
 
 > **Final direction:** finish a rock-solid **structural knowledge graph** (Phase 1), then
@@ -403,15 +435,21 @@ then in Neo4j: `MATCH ()-[r:CALLS]->() RETURN r.extractor, r.origin, count(*)`.
 - [ ] *Upgrade (in M3):* SCIP-precise Python types → these become EXTRACTED instead of
       INFERRED; add `BOUNDS` for class type-params. (Edge types live in `schema.py`.)
 
-**Milestone 3 — Symbol Resolution (complete it)** ⭐⭐⭐⭐⭐
-- [x] Python via SCIP: defs/refs/scopes/imports → EXTRACTED CALLS (84.8%P/92.5%R vs heuristic).
-- [ ] **scip-java** for Java (blocked: needs maven/gradle). Surface aliases/imports/exports
-      as first-class. Goal: every identifier resolves to exactly one symbol.
+**Milestone 3 — Symbol Resolution (mostly done; rest blocked)** ⭐⭐⭐⭐⭐
+- [x] Python via SCIP: defs/refs/scopes → EXTRACTED CALLS (84.8%P/92.5%R) + OVERRIDES.
+- [ ] **scip-java** for Java — **BLOCKED**: needs maven/gradle (none installed). Java stays
+      heuristic until a JVM build exists.
+- [ ] *Deferred (low ROI now):* SCIP-precise Python type edges (RETURNS/OF_TYPE/HAS_TYPE
+      EXTRACTED instead of INFERRED) + `BOUNDS`. Types already work + are queryable.
 
-**Milestone 4 — Program Relationships** ⭐⭐⭐⭐⭐ (biggest gap today)
-- [ ] `READS`, `WRITES`, `OVERRIDES`, `DECLARES`, `USES_TYPE`, `THROWS`, `CATCHES`.
-      `OVERRIDES`/`READS` from SCIP; ⚠ `WRITES` needs AST (scip-python emits no WriteAccess).
-      End state: the graph understands **state**.
+**Milestone 4 — Program Relationships ✅ DONE**
+- [x] `OVERRIDES` (SCIP `is_implementation`, EXTRACTED) — subclass→base method.
+- [x] `READS`/`WRITES` (AST): `self.<f>`/`this.<f>` resolved to the enclosing class's Field
+      (scope-exact, EXTRACTED). Python **instance fields** now modeled as Field nodes.
+- [x] `THROWS` (raise / `throw new` / Java `throws` clause) + `CATCHES` (except / catch),
+      resolved to in-repo exception Classes (external ones excluded).
+- [n/a] `DECLARES` = CONTAINS (no dup edge); `USES_TYPE` covered by HAS_TYPE — both skipped.
+      The graph now understands **state** (who reads/writes each field).
 
 **Milestone 5 — Static Metrics** ⭐⭐⭐⭐ (pure compiler facts, no LLM)
 - [ ] Per Function: cyclomatic complexity, LOC, fan-in, fan-out, call/branch/loop count,

@@ -44,6 +44,7 @@ def extract(file: FileInfo, repo: str):
     nodes: list[Node] = []
     edges: list[Edge] = []
     refs: list[RawRef] = []
+    created_fields: set[str] = set()   # field ids already materialized (dedup)
 
     def contains(container_id: str, child_node, child_id: str):
         edges.append(Edge(
@@ -163,6 +164,9 @@ def extract(file: FileInfo, repo: str):
                     callee = _dotted_tail(src, fn)
                     if callee:
                         ref("CALLS", mid, callee, "call", fn, recv=_receiver(src, fn))
+            _emit_exceptions(body, mid)
+            if in_class:
+                _emit_state(body, mid, parent_fqn, container_id)
             walk_block(body, fqn, mid, in_class=False)
         return mid
 
@@ -190,6 +194,9 @@ def extract(file: FileInfo, repo: str):
                     fname = text(src, left)
                     ffqn = f"{class_fqn}.{fname}"
                     fid = make_id(repo, ffqn, "field")
+                    if fid in created_fields:
+                        continue
+                    created_fields.add(fid)
                     type_node = c.child_by_field_name("type")
                     nodes.append(Node(
                         id=fid, label="Field", name=fname, fqn=ffqn, repo=repo,
@@ -203,6 +210,59 @@ def extract(file: FileInfo, repo: str):
                     contains(class_id, stmt, fid)
                     if type_node is not None:
                         _emit_type(ref, "OF_TYPE", fid, src, type_node)
+
+    def _emit_exceptions(body, fn_id):
+        for n in _scope_walk(body):
+            if n.type == "raise_statement":
+                for c in n.children:
+                    if c.type in ("raise", "from"):
+                        continue
+                    nm = _dotted_tail(src, c)
+                    if nm:
+                        ref("THROWS", fn_id, nm, "type", c)
+                    break
+            elif n.type == "except_clause":
+                for c in n.children:
+                    if c.type in ("except", ":", "as", "block", "comment"):
+                        continue
+                    for nm in _collect_type_names(src, c):
+                        ref("CATCHES", fn_id, nm, "type", c)
+                    break
+
+    def _ensure_field(class_fqn, class_id, name, node):
+        ffqn = f"{class_fqn}.{name}"
+        fid = make_id(repo, ffqn, "field")
+        if fid not in created_fields:
+            created_fields.add(fid)
+            nodes.append(Node(
+                id=fid, label="Field", name=name, fqn=ffqn, repo=repo, kind="field",
+                lang="python", file=file.relpath,
+                start_line=node.start_point[0] + 1, start_col=node.start_point[1],
+                end_line=node.end_point[0] + 1, end_col=node.end_point[1],
+                visibility=_visibility(name), extractor=EXTRACTOR))
+            contains(class_id, node, fid)
+        return fid
+
+    def _emit_state(body, fn_id, class_fqn, class_id):
+        """READS/WRITES of `self.<field>` within a method (cross-object deferred)."""
+        write_ids = set()
+        for n in _scope_walk(body):
+            if n.type in ("assignment", "augmented_assignment"):
+                left = n.child_by_field_name("left")
+                if left is None:
+                    continue
+                for a in _assign_targets(src, left):
+                    write_ids.add(a.id)   # tree-sitter node id (stable across wrappers)
+                    name = _self_attr_name(src, a)
+                    _ensure_field(class_fqn, class_id, name, a)
+                    ref("WRITES", fn_id, name, "field", a, recv="self")
+                    if n.type == "augmented_assignment":
+                        ref("READS", fn_id, name, "field", a, recv="self")
+        for n in _scope_walk(body):
+            if n.type == "attribute" and _self_attr_name(src, n) and n.id not in write_ids:
+                name = _self_attr_name(src, n)
+                _ensure_field(class_fqn, class_id, name, n)
+                ref("READS", fn_id, name, "field", n, recv="self")
 
     # top-level imports
     for child in root.children:
@@ -305,18 +365,42 @@ def _has_abc_base(src: bytes, class_node) -> bool:
     return "ABC" in txt or "ABCMeta" in txt
 
 
-def _calls_in_scope(block):
-    """Yield `call` nodes lexically inside `block` but not inside a nested
-    function/class definition (those are extracted with their own scope)."""
+def _scope_walk(block):
+    """Yield nodes lexically inside `block` but not inside a nested function/class
+    definition (those are extracted with their own scope)."""
     stack = list(reversed(block.children))
     while stack:
         cur = stack.pop()
         if cur.type in ("function_definition", "class_definition", "decorated_definition"):
             continue
-        if cur.type == "call":
-            yield cur
+        yield cur
         if cur.children:
             stack.extend(reversed(cur.children))
+
+
+def _calls_in_scope(block):
+    return (n for n in _scope_walk(block) if n.type == "call")
+
+
+def _self_attr_name(src: bytes, node) -> str:
+    """If `node` is `self.<x>` / `cls.<x>`, return 'x'; else ''."""
+    if node.type != "attribute":
+        return ""
+    obj = node.child_by_field_name("object")
+    if obj is None or obj.type != "identifier" or text(src, obj) not in ("self", "cls"):
+        return ""
+    attr = node.child_by_field_name("attribute")
+    return text(src, attr) if attr else ""
+
+
+def _assign_targets(src: bytes, left):
+    """Direct `self.x` assignment targets (incl. tuple-unpacking targets)."""
+    if left.type == "attribute" and _self_attr_name(src, left):
+        return [left]
+    if left.type in ("pattern_list", "tuple", "tuple_pattern", "list_pattern"):
+        return [c for c in left.children
+                if c.type == "attribute" and _self_attr_name(src, c)]
+    return []
 
 
 def _receiver(src: bytes, fn) -> str:
