@@ -5,9 +5,8 @@ from .models import Edge, Node
 
 
 REQUIRED_RELATIONS = {
+    "CONTAINS",
     "CALLS",
-    "DECLARES",
-    "USES_TYPE",
 }
 
 

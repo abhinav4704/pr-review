@@ -6,7 +6,7 @@ Emits:
            modifiers, is_static/abstract, return_type, param_count).
     Edges (resolved): CONTAINS — with provenance.
         RawRefs (name-only): IMPORTS, EXTENDS, IMPLEMENTS, CALLS, INSTANTIATES,
-            ANNOTATED_WITH, ENTRYPOINT — each carrying the reference-site location.
+            ANNOTATED_WITH — each carrying the reference-site location.
 """
 from __future__ import annotations
 
@@ -31,15 +31,6 @@ _VISIBILITY = {"public", "private", "protected"}
 _MODIFIER_KEYWORDS = {
     "static", "final", "abstract", "synchronized", "native", "transient",
     "volatile", "default", "sealed", "strictfp",
-}
-_SPRING_CONTROLLER_ANNOTATIONS = {"RestController", "Controller"}
-_SPRING_HTTP_MAPPING_ANNOTATIONS = {
-    "RequestMapping",
-    "GetMapping",
-    "PostMapping",
-    "PutMapping",
-    "DeleteMapping",
-    "PatchMapping",
 }
 
 
@@ -140,13 +131,13 @@ def extract(file: FileInfo, repo: str):
         if body:
             for child in body.children:
                 if child.type in ("method_declaration", "constructor_declaration"):
-                    walk_method(child, fqn, cid, anns)
+                    walk_method(child, fqn, cid)
                 elif child.type == "field_declaration":
                     walk_field(child, fqn, cid)
                 elif child.type in _TYPE_DECLS:
                     walk_type(child, fqn, cid)
 
-    def walk_method(node, class_fqn, class_id, class_annotations):
+    def walk_method(node, class_fqn, class_id):
         name_node = node.child_by_field_name("name")
         is_ctor = node.type == "constructor_declaration"
         name = text(src, name_node) if name_node else (class_fqn.rsplit(".", 1)[-1] if is_ctor else "<anon>")
@@ -179,19 +170,6 @@ def extract(file: FileInfo, repo: str):
         contains(class_id, node, mid)
         for ann in anns:
             ref("ANNOTATED_WITH", mid, ann, "annotation", node)
-        if (
-            any(a in _SPRING_CONTROLLER_ANNOTATIONS for a in class_annotations)
-            and any(a in _SPRING_HTTP_MAPPING_ANNOTATIONS for a in anns)
-        ):
-            # Spring mapping annotations mark controller methods as HTTP entrypoints.
-            ref(
-                "ENTRYPOINT",
-                class_id,
-                name,
-                "call",
-                node,
-                call_arity=_param_count(params_node),
-            )
         # type edges: return type + parameter types
         if rt_node is not None and not is_ctor:
             _emit_type(ref, "RETURNS", mid, src, rt_node)

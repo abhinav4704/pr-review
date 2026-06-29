@@ -206,7 +206,7 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
             cov.resolved += 1
             continue
 
-        if ref.type in ("CALLS", "ENTRYPOINT"):
+        if ref.type == "CALLS":
             wanted, strategy = narrow_call(ref)
             emit(
                 ref,

@@ -7,14 +7,11 @@ from dataclasses import dataclass, field
 from . import extractors
 from .canonical_ir import from_extractor, merge_bundles
 from .discovery import discover
-from .models import Edge, Node, Origin, RawRef
+from .models import Edge, Node, RawRef
 from .resolver import Coverage, resolve
 from .scip_resolver import ScipReport, scip_resolve
 from .store import GraphStore
 from .validator import validate_graph
-
-
-_TYPE_RELATIONS = {"RETURNS", "OF_TYPE", "HAS_TYPE", "HAS_GENERIC"}
 
 
 @dataclass
@@ -69,7 +66,6 @@ def index_repo(root: str, repo: str, store: GraphStore, wipe: bool = True,
             all_edges.extend(scip_edges)
             coverage.pop("CALLS", None)  # superseded by SCIP for Python
 
-    all_edges.extend(_derive_deterministic_edges(all_nodes, all_edges))
     _attach_call_metrics(all_nodes, all_edges)
     validation = validate_graph(all_nodes, all_edges)
 
@@ -90,54 +86,6 @@ def index_repo(root: str, repo: str, store: GraphStore, wipe: bool = True,
         db_counts=store.counts(repo),
         scip=scip_report,
     )
-
-
-def _derive_deterministic_edges(nodes: list[Node], edges: list[Edge]) -> list[Edge]:
-    nodes_by_id = {n.id: n for n in nodes}
-    out: list[Edge] = []
-    seen: set[tuple[str, str, str]] = {(e.type, e.src, e.dst) for e in edges}
-
-    for e in edges:
-        key = ("DECLARES", e.src, e.dst)
-        if e.type == "CONTAINS" and key not in seen:
-            src = nodes_by_id.get(e.src)
-            dst = nodes_by_id.get(e.dst)
-            if src and dst and src.label in ("File", "Module", "Class"):
-                out.append(
-                    Edge(
-                        "DECLARES",
-                        e.src,
-                        e.dst,
-                        confidence=e.confidence,
-                        origin=Origin.DERIVED.value,
-                        extractor="deterministic",
-                        evidence_file=e.evidence_file,
-                        evidence_line=e.evidence_line,
-                        evidence_col=e.evidence_col,
-                        strategy="contains_alias",
-                    )
-                )
-                seen.add(key)
-
-        key = ("USES_TYPE", e.src, e.dst)
-        if e.type in _TYPE_RELATIONS and key not in seen:
-            out.append(
-                Edge(
-                    "USES_TYPE",
-                    e.src,
-                    e.dst,
-                    confidence=e.confidence,
-                    origin=Origin.DERIVED.value,
-                    extractor="deterministic",
-                    evidence_file=e.evidence_file,
-                    evidence_line=e.evidence_line,
-                    evidence_col=e.evidence_col,
-                    strategy="type_alias",
-                )
-            )
-            seen.add(key)
-
-    return out
 
 
 def _attach_call_metrics(nodes: list[Node], edges: list[Edge]) -> None:

@@ -5,8 +5,7 @@ Emits:
            — with full metadata (range incl. columns, visibility, modifiers,
              is_async/static/abstract, return_type, param_count, docstring).
     Edges (resolved): CONTAINS — with provenance (origin/extractor/evidence loc).
-        RawRefs (name-only): IMPORTS, EXTENDS, CALLS, ANNOTATED_WITH (decorators),
-            ENTRYPOINT (framework routes/endpoints)
+        RawRefs (name-only): IMPORTS, EXTENDS, CALLS, ANNOTATED_WITH (decorators)
            — each carrying the reference-site location for edge provenance.
 """
 from __future__ import annotations
@@ -20,10 +19,6 @@ from ..languages import get_parser
 from .common import text
 
 EXTRACTOR = "tree-sitter"
-_FASTAPI_HTTP_DECORATORS = {
-    "get", "post", "put", "delete", "patch", "options", "head", "route"
-}
-_DJANGO_ROUTE_CALLS = {"path", "re_path", "url"}
 
 
 def _module_fqn(relpath: str) -> str:
@@ -170,16 +165,6 @@ def extract(file: FileInfo, repo: str):
         contains(container_id, node, mid)
         for dname, dnode in decos:
             ref("ANNOTATED_WITH", mid, dname, "annotation", dnode)
-            if dname in _FASTAPI_HTTP_DECORATORS:
-                # Route decorator marks this function as an HTTP entrypoint.
-                ref(
-                    "ENTRYPOINT",
-                    file_id,
-                    name,
-                    "call",
-                    dnode,
-                    call_arity=_param_count(params_node, in_class),
-                )
         # type edges: return annotation + parameter annotations
         if rt_node is not None:
             _emit_type(ref, "RETURNS", mid, src, rt_node)
@@ -333,25 +318,6 @@ def extract(file: FileInfo, repo: str):
                     import_fqn=text(src, mod).strip(),
                 )
 
-    # Django-style URL routing: path("route", view_fn, ...)
-    for n in _scope_walk(root):
-        if n.type != "call":
-            continue
-        fn = n.child_by_field_name("function")
-        if fn is None:
-            continue
-        callee = _dotted_tail(src, fn)
-        if callee not in _DJANGO_ROUTE_CALLS:
-            continue
-        args = _call_args(n)
-        if len(args) < 2:
-            continue
-        if args[0].type != "string":
-            continue
-        view_name = _dotted_tail(src, args[1])
-        if view_name:
-            ref("ENTRYPOINT", file_id, view_name, "call", n)
-
     walk_block(root, module_fqn, file_id, in_class=False)
     return nodes, edges, refs
 
@@ -500,18 +466,6 @@ def _call_arity(call_node) -> int:
             continue
         count += 1
     return count
-
-
-def _call_args(call_node):
-    args = call_node.child_by_field_name("arguments")
-    if args is None:
-        return []
-    out = []
-    for c in args.children:
-        if c.type in ("(", ")", ","):
-            continue
-        out.append(c)
-    return out
 
 
 def _import_full_name(src: bytes, node) -> str:
