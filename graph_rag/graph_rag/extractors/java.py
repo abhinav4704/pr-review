@@ -5,8 +5,8 @@ Emits:
            constructor), Field — with metadata (range incl. columns, visibility,
            modifiers, is_static/abstract, return_type, param_count).
     Edges (resolved): CONTAINS — with provenance.
-    RawRefs (name-only): IMPORTS, EXTENDS, IMPLEMENTS, CALLS, INSTANTIATES,
-            ANNOTATED_WITH — each carrying the reference-site location.
+        RawRefs (name-only): IMPORTS, EXTENDS, IMPLEMENTS, CALLS, INSTANTIATES,
+            ANNOTATED_WITH, ENTRYPOINT — each carrying the reference-site location.
 """
 from __future__ import annotations
 
@@ -32,6 +32,15 @@ _MODIFIER_KEYWORDS = {
     "static", "final", "abstract", "synchronized", "native", "transient",
     "volatile", "default", "sealed", "strictfp",
 }
+_SPRING_CONTROLLER_ANNOTATIONS = {"RestController", "Controller"}
+_SPRING_HTTP_MAPPING_ANNOTATIONS = {
+    "RequestMapping",
+    "GetMapping",
+    "PostMapping",
+    "PutMapping",
+    "DeleteMapping",
+    "PatchMapping",
+}
 
 
 def extract(file: FileInfo, repo: str):
@@ -52,11 +61,12 @@ def extract(file: FileInfo, repo: str):
             evidence_col=child_node.start_point[1],
         ))
 
-    def ref(rtype, src_id, target, kind_hint, node, recv=""):
+    def ref(rtype, src_id, target, kind_hint, node, recv="", call_arity=-1):
         refs.append(RawRef(
             rtype, src_id, target, kind_hint, recv=recv,
             ref_file=file.relpath,
             ref_line=node.start_point[0] + 1, ref_col=node.start_point[1],
+            call_arity=call_arity,
         ))
 
     file_fqn = file.relpath
@@ -130,13 +140,13 @@ def extract(file: FileInfo, repo: str):
         if body:
             for child in body.children:
                 if child.type in ("method_declaration", "constructor_declaration"):
-                    walk_method(child, fqn, cid)
+                    walk_method(child, fqn, cid, anns)
                 elif child.type == "field_declaration":
                     walk_field(child, fqn, cid)
                 elif child.type in _TYPE_DECLS:
                     walk_type(child, fqn, cid)
 
-    def walk_method(node, class_fqn, class_id):
+    def walk_method(node, class_fqn, class_id, class_annotations):
         name_node = node.child_by_field_name("name")
         is_ctor = node.type == "constructor_declaration"
         name = text(src, name_node) if name_node else (class_fqn.rsplit(".", 1)[-1] if is_ctor else "<anon>")
@@ -146,6 +156,9 @@ def extract(file: FileInfo, repo: str):
         vis, mods, anns = modifiers_of(node)
         rt_node = node.child_by_field_name("type")
         return_type = simple_type_name(text(src, rt_node)) if rt_node is not None else ""
+        body = node.child_by_field_name("body")
+        branch_count, loop_count = _complexity_counts(body)
+        cyclomatic = 1 + branch_count + loop_count
         fqn = f"{class_fqn}#{name}"
         mid = make_id(repo, f"{fqn}{params}", "method")
         nodes.append(Node(
@@ -157,11 +170,28 @@ def extract(file: FileInfo, repo: str):
             visibility=vis, modifiers=mods, is_static="static" in mods,
             is_abstract="abstract" in mods, return_type=return_type,
             param_count=_param_count(params_node), signature=signature,
+            loc=(node.end_point[0] - node.start_point[0]) + 1,
+            cyclomatic=cyclomatic,
+            branch_count=branch_count,
+            loop_count=loop_count,
             body_hash=body_hash(text(src, node)), extractor=EXTRACTOR,
         ))
         contains(class_id, node, mid)
         for ann in anns:
             ref("ANNOTATED_WITH", mid, ann, "annotation", node)
+        if (
+            any(a in _SPRING_CONTROLLER_ANNOTATIONS for a in class_annotations)
+            and any(a in _SPRING_HTTP_MAPPING_ANNOTATIONS for a in anns)
+        ):
+            # Spring mapping annotations mark controller methods as HTTP entrypoints.
+            ref(
+                "ENTRYPOINT",
+                class_id,
+                name,
+                "call",
+                node,
+                call_arity=_param_count(params_node),
+            )
         # type edges: return type + parameter types
         if rt_node is not None and not is_ctor:
             _emit_type(ref, "RETURNS", mid, src, rt_node)
@@ -178,7 +208,6 @@ def extract(file: FileInfo, repo: str):
                 for t in _types_in(src, c):
                     ref("THROWS", mid, t, "type", c)
 
-        body = node.child_by_field_name("body")
         if body:
             # field-writes: `this.x = ...` (LHS of an assignment)
             write_fa = set()
@@ -191,7 +220,14 @@ def extract(file: FileInfo, repo: str):
                 if d.type == "method_invocation":
                     nm = d.child_by_field_name("name")
                     if nm:
-                        ref("CALLS", mid, text(src, nm), "call", d)
+                        ref(
+                            "CALLS",
+                            mid,
+                            text(src, nm),
+                            "call",
+                            d,
+                            call_arity=_call_arity(d),
+                        )
                 elif d.type == "object_creation_expression":
                     tp = d.child_by_field_name("type")
                     if tp:
@@ -306,6 +342,18 @@ def _import_name(src: bytes, node) -> str:
     return ""
 
 
+def _call_arity(call_node) -> int:
+    args = call_node.child_by_field_name("arguments")
+    if args is None:
+        return -1
+    count = 0
+    for c in args.children:
+        if c.type in ("(", ")", ","):
+            continue
+        count += 1
+    return count
+
+
 def _types_in(src: bytes, node):
     """Collect simple type names under a superclass/interfaces node."""
     out = []
@@ -315,3 +363,24 @@ def _types_in(src: bytes, node):
             if name and name not in out:
                 out.append(name)
     return out
+
+
+def _complexity_counts(body):
+    if body is None:
+        return 0, 0
+    branch_nodes = {
+        "if_statement",
+        "switch_expression",
+        "switch_block_statement_group",
+        "conditional_expression",
+        "catch_clause",
+    }
+    loop_nodes = {"for_statement", "enhanced_for_statement", "while_statement", "do_statement"}
+    branch_count = 0
+    loop_count = 0
+    for n in iter_descendants(body):
+        if n.type in branch_nodes:
+            branch_count += 1
+        if n.type in loop_nodes:
+            loop_count += 1
+    return branch_count, loop_count

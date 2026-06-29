@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -36,6 +37,24 @@ def _cmd_index(args) -> int:
             f"ambiguous={cov.ambiguous:<5} unresolved={cov.unresolved:<5} "
             f"external={cov.external}"
         )
+
+    vr = res.validation or {}
+    if vr:
+        print("\n  validation:")
+        print(f"    ok={vr.get('ok', False)}  errors={len(vr.get('errors', []))}  warnings={len(vr.get('warnings', []))}")
+        for e in vr.get("errors", []):
+            print(f"    error: {e}")
+        for w in vr.get("warnings", []):
+            print(f"    warn:  {w}")
+
+    if args.validation_report:
+        with open(args.validation_report, "w", encoding="utf-8") as f:
+            json.dump(vr, f, indent=2, sort_keys=True)
+        print(f"\n  wrote validation report: {args.validation_report}")
+
+    if args.fail_on_validation_error and not vr.get("ok", False):
+        print("\n  validation failed: exiting with non-zero status")
+        return 2
     print()
     return 0
 
@@ -49,6 +68,8 @@ def main(argv=None) -> int:
     idx.add_argument("--repo", default=None, help="repo name (default: dir name)")
     idx.add_argument("--no-wipe", action="store_true", help="do not delete existing repo nodes first")
     idx.add_argument("--no-scip", action="store_true", help="skip SCIP; use only the heuristic resolver")
+    idx.add_argument("--validation-report", default=None, help="write validation JSON report to this file")
+    idx.add_argument("--fail-on-validation-error", action="store_true", help="exit non-zero if validation has errors")
     idx.set_defaults(func=_cmd_index)
 
     args = p.parse_args(argv)

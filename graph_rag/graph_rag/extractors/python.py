@@ -5,7 +5,8 @@ Emits:
            — with full metadata (range incl. columns, visibility, modifiers,
              is_async/static/abstract, return_type, param_count, docstring).
     Edges (resolved): CONTAINS — with provenance (origin/extractor/evidence loc).
-    RawRefs (name-only): IMPORTS, EXTENDS, CALLS, ANNOTATED_WITH (decorators)
+        RawRefs (name-only): IMPORTS, EXTENDS, CALLS, ANNOTATED_WITH (decorators),
+            ENTRYPOINT (framework routes/endpoints)
            — each carrying the reference-site location for edge provenance.
 """
 from __future__ import annotations
@@ -19,6 +20,10 @@ from ..languages import get_parser
 from .common import text
 
 EXTRACTOR = "tree-sitter"
+_FASTAPI_HTTP_DECORATORS = {
+    "get", "post", "put", "delete", "patch", "options", "head", "route"
+}
+_DJANGO_ROUTE_CALLS = {"path", "re_path", "url"}
 
 
 def _module_fqn(relpath: str) -> str:
@@ -55,11 +60,24 @@ def extract(file: FileInfo, repo: str):
             evidence_col=child_node.start_point[1],
         ))
 
-    def ref(rtype, src_id, target, kind_hint, node, recv=""):
+    def ref(
+        rtype,
+        src_id,
+        target,
+        kind_hint,
+        node,
+        recv="",
+        call_arity=-1,
+        recv_type="",
+        import_fqn="",
+    ):
         refs.append(RawRef(
             rtype, src_id, target, kind_hint, recv=recv,
+            recv_type=recv_type,
+            import_fqn=import_fqn,
             ref_file=file.relpath,
             ref_line=node.start_point[0] + 1, ref_col=node.start_point[1],
+            call_arity=call_arity,
         ))
 
     module_fqn = _module_fqn(file.relpath)
@@ -128,6 +146,9 @@ def extract(file: FileInfo, repo: str):
         is_static = "staticmethod" in deco_names
         is_classmethod = "classmethod" in deco_names
         kind = "function" if not in_class else ("method")
+        body = node.child_by_field_name("body")
+        branch_count, loop_count = _complexity_counts(body)
+        cyclomatic = 1 + branch_count + loop_count
         mid = make_id(repo, fqn, "method" if in_class else "function")
         nodes.append(Node(
             id=mid, label="Function", name=name, fqn=fqn, repo=repo, kind=kind,
@@ -140,11 +161,25 @@ def extract(file: FileInfo, repo: str):
             is_async=_is_async(node),
             return_type=return_type, param_count=_param_count(params_node, in_class),
             signature=f"{name}{params}", docstring=_docstring(src, node),
+            loc=(node.end_point[0] - node.start_point[0]) + 1,
+            cyclomatic=cyclomatic,
+            branch_count=branch_count,
+            loop_count=loop_count,
             body_hash=body_hash(text(src, node)), extractor=EXTRACTOR,
         ))
         contains(container_id, node, mid)
         for dname, dnode in decos:
             ref("ANNOTATED_WITH", mid, dname, "annotation", dnode)
+            if dname in _FASTAPI_HTTP_DECORATORS:
+                # Route decorator marks this function as an HTTP entrypoint.
+                ref(
+                    "ENTRYPOINT",
+                    file_id,
+                    name,
+                    "call",
+                    dnode,
+                    call_arity=_param_count(params_node, in_class),
+                )
         # type edges: return annotation + parameter annotations
         if rt_node is not None:
             _emit_type(ref, "RETURNS", mid, src, rt_node)
@@ -154,8 +189,8 @@ def extract(file: FileInfo, repo: str):
                     t = p.child_by_field_name("type")
                     if t is not None:
                         _emit_type(ref, "HAS_TYPE", mid, src, t)
-        body = node.child_by_field_name("body")
         if body:
+            receiver_types = _local_receiver_types(src, body)
             # Only calls directly in this function's scope — nested defs are
             # walked separately so their calls aren't double-attributed here.
             for d in _calls_in_scope(body):
@@ -163,7 +198,16 @@ def extract(file: FileInfo, repo: str):
                 if fn is not None:
                     callee = _dotted_tail(src, fn)
                     if callee:
-                        ref("CALLS", mid, callee, "call", fn, recv=_receiver(src, fn))
+                        ref(
+                            "CALLS",
+                            mid,
+                            callee,
+                            "call",
+                            fn,
+                            recv=_receiver(src, fn),
+                            call_arity=_call_arity(d),
+                            recv_type=_infer_receiver_type(src, fn, receiver_types),
+                        )
             _emit_exceptions(body, mid)
             if in_class:
                 _emit_state(body, mid, parent_fqn, container_id)
@@ -269,11 +313,44 @@ def extract(file: FileInfo, repo: str):
         if child.type == "import_statement":
             for c in child.children:
                 if c.type in ("dotted_name", "aliased_import"):
-                    ref("IMPORTS", file_id, _dotted_tail(src, c), "import", c)
+                    ref(
+                        "IMPORTS",
+                        file_id,
+                        _dotted_tail(src, c),
+                        "import",
+                        c,
+                        import_fqn=_import_full_name(src, c),
+                    )
         elif child.type == "import_from_statement":
             mod = child.child_by_field_name("module_name")
             if mod is not None:
-                ref("IMPORTS", file_id, _dotted_tail(src, mod), "import", mod)
+                ref(
+                    "IMPORTS",
+                    file_id,
+                    _dotted_tail(src, mod),
+                    "import",
+                    mod,
+                    import_fqn=text(src, mod).strip(),
+                )
+
+    # Django-style URL routing: path("route", view_fn, ...)
+    for n in _scope_walk(root):
+        if n.type != "call":
+            continue
+        fn = n.child_by_field_name("function")
+        if fn is None:
+            continue
+        callee = _dotted_tail(src, fn)
+        if callee not in _DJANGO_ROUTE_CALLS:
+            continue
+        args = _call_args(n)
+        if len(args) < 2:
+            continue
+        if args[0].type != "string":
+            continue
+        view_name = _dotted_tail(src, args[1])
+        if view_name:
+            ref("ENTRYPOINT", file_id, view_name, "call", n)
 
     walk_block(root, module_fqn, file_id, in_class=False)
     return nodes, edges, refs
@@ -410,6 +487,101 @@ def _receiver(src: bytes, fn) -> str:
         return ""
     obj = fn.child_by_field_name("object")
     return _dotted_tail(src, obj) if obj is not None else ""
+
+
+def _call_arity(call_node) -> int:
+    """Best-effort positional+keyword argument count for a call expression."""
+    args = call_node.child_by_field_name("arguments")
+    if args is None:
+        return -1
+    count = 0
+    for c in args.children:
+        if c.type in ("(", ")", ","):
+            continue
+        count += 1
+    return count
+
+
+def _call_args(call_node):
+    args = call_node.child_by_field_name("arguments")
+    if args is None:
+        return []
+    out = []
+    for c in args.children:
+        if c.type in ("(", ")", ","):
+            continue
+        out.append(c)
+    return out
+
+
+def _import_full_name(src: bytes, node) -> str:
+    raw = text(src, node).strip()
+    if " as " in raw:
+        raw = raw.split(" as ", 1)[0].strip()
+    return raw
+
+
+def _local_receiver_types(src: bytes, body) -> dict[str, str]:
+    """Infer simple local variable -> class type bindings in function scope."""
+    out: dict[str, str] = {}
+    for n in _scope_walk(body):
+        if n.type == "assignment":
+            left = n.child_by_field_name("left")
+            right = n.child_by_field_name("right")
+            if left is None or right is None or left.type != "identifier":
+                continue
+            var = text(src, left)
+            tp = _inferred_type_name(src, right)
+            if var and tp:
+                out[var] = tp
+        elif n.type == "annotated_assignment":
+            left = n.child_by_field_name("left")
+            anno = n.child_by_field_name("type")
+            if left is None or anno is None or left.type != "identifier":
+                continue
+            var = text(src, left)
+            tp = _dotted_tail(src, anno)
+            if var and tp:
+                out[var] = tp
+    return out
+
+
+def _inferred_type_name(src: bytes, node) -> str:
+    if node.type == "call":
+        fn = node.child_by_field_name("function")
+        if fn is None:
+            return ""
+        return _dotted_tail(src, fn)
+    if node.type in ("identifier", "attribute"):
+        return _dotted_tail(src, node)
+    return ""
+
+
+def _infer_receiver_type(src: bytes, fn_node, local_types: dict[str, str]) -> str:
+    if fn_node.type != "attribute":
+        return ""
+    obj = fn_node.child_by_field_name("object")
+    if obj is None:
+        return ""
+    if obj.type == "identifier":
+        name = text(src, obj)
+        return local_types.get(name, "")
+    return ""
+
+
+def _complexity_counts(body):
+    if body is None:
+        return 0, 0
+    branch_nodes = {"if_statement", "conditional_expression", "match_statement", "except_clause"}
+    loop_nodes = {"for_statement", "while_statement"}
+    branch_count = 0
+    loop_count = 0
+    for n in _scope_walk(body):
+        if n.type in branch_nodes:
+            branch_count += 1
+        if n.type in loop_nodes:
+            loop_count += 1
+    return branch_count, loop_count
 
 
 def _dotted_tail(src: bytes, node) -> str:

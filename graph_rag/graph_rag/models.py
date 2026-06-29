@@ -61,6 +61,14 @@ class Node:
     signature: str = ""
     docstring: str = ""
     body_hash: str = ""
+    # static metrics (M5)
+    loc: int = 0
+    cyclomatic: int = 0
+    branch_count: int = 0
+    loop_count: int = 0
+    fan_in: int = 0
+    fan_out: int = 0
+    recursive: bool = False
     # provenance
     extractor: str = ""              # who produced this node (tree-sitter)
     confidence: str = Confidence.EXTRACTED.value
@@ -89,6 +97,13 @@ class Node:
             "signature": self.signature,
             "docstring": self.docstring,
             "body_hash": self.body_hash,
+            "loc": self.loc,
+            "cyclomatic": self.cyclomatic,
+            "branch_count": self.branch_count,
+            "loop_count": self.loop_count,
+            "fan_in": self.fan_in,
+            "fan_out": self.fan_out,
+            "recursive": self.recursive,
             "extractor": self.extractor,
             "confidence": self.confidence,
         })
@@ -106,6 +121,7 @@ class Edge:
     evidence_file: str = ""          # where the evidence for this edge lives
     evidence_line: int = 0           # 1-based
     evidence_col: int = 0            # 0-based
+    strategy: str = ""              # resolver strategy used for destination selection
 
     def props(self) -> dict:
         return _clean({
@@ -115,6 +131,7 @@ class Edge:
             "evidence_file": self.evidence_file,
             "evidence_line": self.evidence_line,
             "evidence_col": self.evidence_col,
+            "strategy": self.strategy,
         })
 
 
@@ -126,7 +143,10 @@ class RawRef:
     target_name: str    # symbol name to resolve against the repo symbol index
     kind_hint: str = "" # 'call' | 'type' | 'import' | 'annotation'
     recv: str = ""      # call receiver tail: 'self'/'cls', a module/class/var name, or '' for a bare call
+    recv_type: str = "" # inferred receiver class/type name when statically available
+    import_fqn: str = "" # fully-qualified import path when available
     # location of the reference site (for edge provenance)
     ref_file: str = ""
     ref_line: int = 0   # 1-based
     ref_col: int = 0    # 0-based
+    call_arity: int = -1

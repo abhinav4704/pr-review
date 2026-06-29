@@ -20,8 +20,10 @@ NODE_LABELS = {
 
 EDGE_TYPES = {
     "CONTAINS",
+    "DECLARES",
     "IMPORTS",
     "CALLS",
+    "ENTRYPOINT",
     "INSTANTIATES",
     "EXTENDS",
     "IMPLEMENTS",
@@ -31,6 +33,7 @@ EDGE_TYPES = {
     "OF_TYPE",      # Field -> Class (declared type)
     "HAS_TYPE",     # Function -> Class (a parameter's type)
     "HAS_GENERIC",  # carrier -> Class (a generic type argument, e.g. List[User])
+    "USES_TYPE",    # Entity -> Class (normalized type-usage edge)
     # Milestone 4 — program relationships
     "OVERRIDES",    # Function -> Function (overrides/implements a base method) [SCIP]
     "READS",        # Function -> Field (reads instance/class state)
