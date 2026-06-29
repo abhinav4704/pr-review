@@ -44,6 +44,7 @@ class Node:
     kind: str = ""      # class|interface|enum|record / method|constructor|function|lambda
     lang: str = ""
     file: str = ""
+    package: str = ""   # owning package/namespace fqn (File: its package)
     # source range (1-based line, 0-based column — matches tree-sitter points)
     start_line: int = 0
     start_col: int = 0
@@ -58,9 +59,15 @@ class Node:
     is_async: bool = False
     return_type: str = ""
     param_count: int = 0
+    param_names: list[str] = field(default_factory=list)   # input parameter names (ordered)
+    param_types: list[str] = field(default_factory=list)   # declared types aligned to param_names ("" if untyped)
     signature: str = ""
     docstring: str = ""
     body_hash: str = ""
+    # HTTP-API metadata (Endpoint nodes)
+    method: str = ""                  # GET|POST|... (Endpoint)
+    route: str = ""                   # normalized URL path (Endpoint)
+    host: str = ""                    # external host, e.g. api.stripe.com ("" = in-repo)
     # static metrics (M5)
     loc: int = 0
     cyclomatic: int = 0
@@ -82,6 +89,7 @@ class Node:
             "kind": self.kind,
             "lang": self.lang,
             "file": self.file,
+            "package": self.package,
             "start_line": self.start_line,
             "start_col": self.start_col,
             "end_line": self.end_line,
@@ -94,9 +102,14 @@ class Node:
             "is_async": self.is_async,
             "return_type": self.return_type,
             "param_count": self.param_count,
+            "param_names": self.param_names,
+            "param_types": self.param_types,
             "signature": self.signature,
             "docstring": self.docstring,
             "body_hash": self.body_hash,
+            "method": self.method,
+            "route": self.route,
+            "host": self.host,
             "loc": self.loc,
             "cyclomatic": self.cyclomatic,
             "branch_count": self.branch_count,
@@ -145,6 +158,7 @@ class RawRef:
     recv: str = ""      # call receiver tail: 'self'/'cls', a module/class/var name, or '' for a bare call
     recv_type: str = "" # inferred receiver class/type name when statically available
     import_fqn: str = "" # fully-qualified import path when available
+    http_method: str = "" # HTTP verb for a CALLS_API ref (GET|POST|...); recv carries the host
     # location of the reference site (for edge provenance)
     ref_file: str = ""
     ref_line: int = 0   # 1-based

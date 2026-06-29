@@ -1,0 +1,7 @@
+.venv
+scip_tooling/node_modules
+**/__pycache__
+**/*.pyc
+.git
+webapp/repos
+*.scip

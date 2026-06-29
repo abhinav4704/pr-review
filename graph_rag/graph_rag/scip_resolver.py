@@ -57,7 +57,12 @@ def run_scip_python(repo_root: str, project_name: str, out_path: str) -> str | N
         return None
     try:
         subprocess.run(
+            # --project-version is required: without it scip-python defaults the
+            # version to `git rev-parse` and crashes on a non-git directory
+            # (e.g. a vendored/extracted source tree). The value is not used in
+            # our definition-location mapping, so a static placeholder is fine.
             [binpath, "index", "--project-name", project_name,
+             "--project-version", "0.0.0",
              "--output", os.path.abspath(out_path), "--quiet"],
             cwd=os.path.abspath(repo_root),
             check=True, capture_output=True, text=True,

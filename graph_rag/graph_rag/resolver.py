@@ -17,6 +17,13 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 
+from .apispec import (
+    endpoint_display,
+    endpoint_fqn,
+    endpoint_id,
+    match_key,
+    normalize_route,
+)
 from .ids import make_id
 from .models import Confidence, Edge, Node, Origin, RawRef
 
@@ -70,6 +77,32 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
             imports_by_file[ref.ref_file].add(_tail_name(ref.target_name))
         if ref.import_fqn:
             import_fqns_by_file[ref.ref_file].add(ref.import_fqn)
+
+    # Endpoint index for CALLS_API matching. Exact key first; templated routes
+    # (segments collapsed to `*`) matched segment-wise so a concrete caller path
+    # `/api/users/42` resolves to the server's `/api/users/{id}`.
+    endpoints_by_key: dict[tuple[str, str], list[Node]] = defaultdict(list)
+    endpoint_patterns: dict[str, list[tuple[list[str], Node]]] = defaultdict(list)
+    for n in nodes:
+        if n.label != "Endpoint":
+            continue
+        method, route = match_key(n.method, n.route)
+        endpoints_by_key[(method, route)].append(n)
+        if "*" in route:
+            endpoint_patterns[method].append((_route_segments(route), n))
+
+    def match_endpoints(method: str, route: str) -> list[Node]:
+        exact = endpoints_by_key.get((method, route))
+        if exact:
+            return exact
+        caller = _route_segments(route)
+        hits = []
+        for segs, ep in endpoint_patterns.get(method, []):
+            if len(segs) == len(caller) and all(
+                ps == "*" or ps == cs for ps, cs in zip(segs, caller)
+            ):
+                hits.append(ep)
+        return hits
 
     methods_of_class: dict[str, dict[str, list[Node]]] = defaultdict(lambda: defaultdict(list))
     fields_of_class: dict[str, dict[str, list[Node]]] = defaultdict(lambda: defaultdict(list))
@@ -159,6 +192,7 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
 
     extra_nodes: list[Node] = []
     annotation_ids: dict[str, str] = {}
+    api_endpoint_ids: set[str] = set()
     out_edges: list[Edge] = []
     coverage: dict[str, Coverage] = defaultdict(Coverage)
 
@@ -206,6 +240,42 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
             cov.resolved += 1
             continue
 
+        if ref.type == "CALLS_API":
+            method = (ref.http_method or "GET").upper()
+            route = normalize_route(ref.target_name)
+            host = ref.recv  # carries the external host ('' for a relative URL)
+            hits = match_endpoints(method, route)
+            if hits:
+                # An in-repo backend exposes this route (resolves cross-file).
+                for ep in hits:
+                    out_edges.append(
+                        make_edge(ref, ep.id, Confidence.EXTRACTED.value, strategy="api_match")
+                    )
+                cov.resolved += 1
+            else:
+                # No in-repo handler: synthesize the target so the edge lands.
+                # External host -> external Endpoint (shared id across repos);
+                # relative path -> an unresolved in-repo Endpoint (a likely dead/
+                # missing route worth surfacing).
+                if host:
+                    eid = endpoint_id("external", method, route, host)
+                    erepo, conf, strat = "external", Confidence.EXTRACTED.value, "api_external"
+                else:
+                    eid = endpoint_id(repo, method, route)
+                    erepo, conf, strat = repo, Confidence.INFERRED.value, "api_unresolved"
+                if eid not in api_endpoint_ids:
+                    api_endpoint_ids.add(eid)
+                    extra_nodes.append(Node(
+                        id=eid, label="Endpoint",
+                        name=endpoint_display(method, route, host),
+                        fqn=endpoint_fqn(method, route, host),
+                        repo=erepo, kind="endpoint",
+                        method=method, route=route, host=host,
+                    ))
+                out_edges.append(make_edge(ref, eid, conf, strategy=strat))
+                cov.resolved += 1
+            continue
+
         if ref.type == "CALLS":
             wanted, strategy = narrow_call(ref)
             emit(
@@ -251,6 +321,10 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
         )
 
     return extra_nodes, out_edges, coverage
+
+
+def _route_segments(route: str) -> list[str]:
+    return [s for s in route.split("/") if s]
 
 
 def _tail_name(name: str) -> str:

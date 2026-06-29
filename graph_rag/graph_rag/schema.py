@@ -10,12 +10,15 @@ from __future__ import annotations
 SHARED_LABEL = "CodeNode"
 
 NODE_LABELS = {
+    "Repository",   # the indexed repo root (one per repo)
+    "Package",      # a package/namespace (Java package decl, Python dir path)
     "File",
     "Module",
     "Class",
     "Function",
     "Field",
     "Annotation",
+    "Endpoint",     # an HTTP endpoint (method + route); in-repo or external
 }
 
 EDGE_TYPES = {
@@ -37,6 +40,9 @@ EDGE_TYPES = {
     "WRITES",       # Function -> Field (mutates instance/class state)
     "THROWS",       # Function -> Class (raises an exception type)
     "CATCHES",      # Function -> Class (catches an exception type)
+    # HTTP-API layer
+    "EXPOSES",      # Function -> Endpoint (backend handler serves this route)
+    "CALLS_API",    # Function -> Endpoint (outbound HTTP call to this route)
 }
 
 

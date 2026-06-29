@@ -6,6 +6,12 @@ import shutil
 from dataclasses import dataclass
 
 
+# npm shims the binary differently per OS: an extension-less script on
+# POSIX, `scip-python.cmd` / `.ps1` on Windows. Probe `.cmd` before `.ps1`
+# because the .cmd shim is what subprocess can launch directly on Windows.
+_SCIP_BIN_NAMES = ("scip-python", "scip-python.cmd", "scip-python.ps1")
+
+
 def scip_python_bin() -> str | None:
     """Locate the scip-python indexer binary.
 
@@ -14,12 +20,17 @@ def scip_python_bin() -> str | None:
     heuristic resolver).
     """
     env = os.environ.get("SCIP_PYTHON_BIN")
-    if env and os.path.exists(env):
-        return env
+    if env:
+        # Honor an explicit path, tolerating a missing Windows extension.
+        for cand in (env, env + ".cmd", env + ".ps1"):
+            if os.path.exists(cand):
+                return cand
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # graph_rag/
-    local = os.path.join(here, "scip_tooling", "node_modules", ".bin", "scip-python")
-    if os.path.exists(local):
-        return local
+    bindir = os.path.join(here, "scip_tooling", "node_modules", ".bin")
+    for name in _SCIP_BIN_NAMES:
+        local = os.path.join(bindir, name)
+        if os.path.exists(local):
+            return local
     return shutil.which("scip-python")
 
 

@@ -12,6 +12,15 @@ from __future__ import annotations
 
 import os
 
+from ..apispec import (
+    HTTP_CLIENT_RECEIVERS,
+    HTTP_METHODS,
+    endpoint_display,
+    endpoint_fqn,
+    endpoint_id,
+    normalize_route,
+    split_url,
+)
 from ..discovery import FileInfo
 from ..ids import body_hash, make_id
 from ..models import Edge, Node, Origin, RawRef
@@ -75,12 +84,40 @@ def extract(file: FileInfo, repo: str):
             call_arity=call_arity,
         ))
 
+    def emit_endpoint(method, route, handler_id, ev_node):
+        """An in-repo route definition: an Endpoint node + EXPOSES from its handler."""
+        eid = endpoint_id(repo, method, route)
+        nodes.append(Node(
+            id=eid, label="Endpoint", name=endpoint_display(method, route),
+            fqn=endpoint_fqn(method, route), repo=repo, kind="endpoint",
+            lang="python", file=file.relpath,
+            start_line=ev_node.start_point[0] + 1, start_col=ev_node.start_point[1],
+            end_line=ev_node.end_point[0] + 1, end_col=ev_node.end_point[1],
+            method=method.upper(), route=normalize_route(route), extractor=EXTRACTOR,
+        ))
+        edges.append(Edge(
+            "EXPOSES", handler_id, eid,
+            origin=Origin.EXTRACTED.value, extractor=EXTRACTOR,
+            evidence_file=file.relpath,
+            evidence_line=ev_node.start_point[0] + 1, evidence_col=ev_node.start_point[1],
+        ))
+
+    def emit_api_call(handler_id, method, url, ev_node):
+        """An outbound HTTP call: a CALLS_API ref resolved against the endpoint index."""
+        host, path = split_url(url)
+        refs.append(RawRef(
+            "CALLS_API", handler_id, path, "api", recv=host, http_method=method,
+            ref_file=file.relpath,
+            ref_line=ev_node.start_point[0] + 1, ref_col=ev_node.start_point[1],
+        ))
+
     module_fqn = _module_fqn(file.relpath)
     file_id = make_id(repo, file.relpath, "file")
+    file_package = os.path.dirname(file.relpath).replace(os.sep, ".")
     nodes.append(Node(
         id=file_id, label="File", name=os.path.basename(file.relpath),
         fqn=file.relpath, repo=repo, kind="file", lang="python",
-        file=file.relpath, start_line=1, start_col=0,
+        file=file.relpath, package=file_package, start_line=1, start_col=0,
         end_line=root.end_point[0] + 1, end_col=root.end_point[1],
         body_hash=file.sha, extractor=EXTRACTOR,
     ))
@@ -144,6 +181,7 @@ def extract(file: FileInfo, repo: str):
         body = node.child_by_field_name("body")
         branch_count, loop_count = _complexity_counts(body)
         cyclomatic = 1 + branch_count + loop_count
+        pnames, ptypes = _params(src, params_node, in_class)
         mid = make_id(repo, fqn, "method" if in_class else "function")
         nodes.append(Node(
             id=mid, label="Function", name=name, fqn=fqn, repo=repo, kind=kind,
@@ -155,6 +193,7 @@ def extract(file: FileInfo, repo: str):
             is_abstract="abstractmethod" in deco_names,
             is_async=_is_async(node),
             return_type=return_type, param_count=_param_count(params_node, in_class),
+            param_names=pnames, param_types=ptypes,
             signature=f"{name}{params}", docstring=_docstring(src, node),
             loc=(node.end_point[0] - node.start_point[0]) + 1,
             cyclomatic=cyclomatic,
@@ -165,6 +204,8 @@ def extract(file: FileInfo, repo: str):
         contains(container_id, node, mid)
         for dname, dnode in decos:
             ref("ANNOTATED_WITH", mid, dname, "annotation", dnode)
+            for method, route in _endpoint_specs(src, dnode):
+                emit_endpoint(method, route, mid, dnode)
         # type edges: return annotation + parameter annotations
         if rt_node is not None:
             _emit_type(ref, "RETURNS", mid, src, rt_node)
@@ -193,6 +234,9 @@ def extract(file: FileInfo, repo: str):
                             call_arity=_call_arity(d),
                             recv_type=_infer_receiver_type(src, fn, receiver_types),
                         )
+                    ob = _outbound_call(src, d)
+                    if ob is not None:
+                        emit_api_call(mid, ob[0], ob[1], fn)
             _emit_exceptions(body, mid)
             if in_class:
                 _emit_state(body, mid, parent_fqn, container_id)
@@ -380,6 +424,58 @@ def _first_is_selfish(node) -> bool:
     return head in ("self", "cls")
 
 
+def _splat_inner(src: bytes, node) -> str:
+    for c in node.children:
+        if c.type == "identifier":
+            return text(src, c)
+    return ""
+
+
+def _params(src: bytes, params_node, in_class: bool):
+    """Ordered (names, types) for input parameters, excluding self/cls.
+    Variadics keep their sigil (`*args`, `**kwargs`); untyped -> ''."""
+    names: list[str] = []
+    types: list[str] = []
+    if params_node is None:
+        return names, types
+    kinds = {
+        "identifier", "typed_parameter", "default_parameter",
+        "typed_default_parameter", "list_splat_pattern", "dictionary_splat_pattern",
+    }
+    params = [c for c in params_node.children if c.type in kinds]
+    if in_class and params and _first_is_selfish(params[0]):
+        params = params[1:]
+    for p in params:
+        nm, tp = "", ""
+        if p.type == "identifier":
+            nm = text(src, p)
+        elif p.type == "list_splat_pattern":
+            nm = "*" + _splat_inner(src, p)
+        elif p.type == "dictionary_splat_pattern":
+            nm = "**" + _splat_inner(src, p)
+        elif p.type == "typed_parameter":
+            for cc in p.children:
+                if cc.type == "identifier":
+                    nm = text(src, cc)
+                elif cc.type == "list_splat_pattern":
+                    nm = "*" + _splat_inner(src, cc)
+                elif cc.type == "dictionary_splat_pattern":
+                    nm = "**" + _splat_inner(src, cc)
+            t = p.child_by_field_name("type")
+            if t is not None:
+                tp = text(src, t).strip()
+        elif p.type in ("default_parameter", "typed_default_parameter"):
+            n_ = p.child_by_field_name("name")
+            nm = text(src, n_) if n_ is not None else ""
+            t = p.child_by_field_name("type")
+            if t is not None:
+                tp = text(src, t).strip()
+        if nm:
+            names.append(nm)
+            types.append(tp)
+    return names, types
+
+
 def _docstring(src: bytes, def_node) -> str:
     body = def_node.child_by_field_name("body")
     if body is None:
@@ -466,6 +562,97 @@ def _call_arity(call_node) -> int:
             continue
         count += 1
     return count
+
+
+def _string_text(src: bytes, node) -> str:
+    """The literal value of a `string` node, without quotes/prefix."""
+    if node.type != "string":
+        return ""
+    for c in node.children:
+        if c.type == "string_content":
+            return text(src, c)
+    return text(src, node).strip("'\"")
+
+
+def _positional_args(call_node):
+    args = call_node.child_by_field_name("arguments")
+    if args is None:
+        return []
+    return [c for c in args.children
+            if c.type not in ("(", ")", ",", "keyword_argument", "comment")]
+
+
+def _string_arg(src: bytes, call_node, index: int) -> str:
+    pos = _positional_args(call_node)
+    if index < len(pos) and pos[index].type == "string":
+        return _string_text(src, pos[index])
+    return ""
+
+
+def _methods_kwarg(src: bytes, call_node) -> list[str]:
+    """HTTP verbs from a `methods=[...]` keyword arg (Flask-style routes)."""
+    args = call_node.child_by_field_name("arguments")
+    out: list[str] = []
+    if args is None:
+        return out
+    for c in args.children:
+        if c.type != "keyword_argument":
+            continue
+        name = c.child_by_field_name("name")
+        val = c.child_by_field_name("value")
+        if name is None or val is None or text(src, name) != "methods":
+            continue
+        for el in val.children:
+            if el.type == "string":
+                m = _string_text(src, el).lower()
+                if m in HTTP_METHODS:
+                    out.append(m)
+    return out
+
+
+def _endpoint_specs(src: bytes, deco_node) -> list[tuple[str, str]]:
+    """Route definitions on a decorator: FastAPI/Flask `@app.get('/x')`,
+    `@router.post('/x')`, `@app.route('/x', methods=['POST'])`."""
+    expr = deco_node.children[1] if len(deco_node.children) > 1 else None
+    if expr is None or expr.type != "call":
+        return []
+    fn = expr.child_by_field_name("function")
+    if fn is None or fn.type != "attribute":
+        return []
+    tail = _dotted_tail(src, fn)
+    route = _string_arg(src, expr, 0)
+    if not route:
+        return []
+    if tail in HTTP_METHODS:
+        return [(tail.upper(), route)]
+    if tail in ("route", "api_route"):
+        methods = _methods_kwarg(src, expr) or ["get"]
+        return [(m.upper(), route) for m in methods]
+    return []
+
+
+def _outbound_call(src: bytes, call_node):
+    """If this call is an outbound HTTP request, return (METHOD, url-literal)."""
+    fn = call_node.child_by_field_name("function")
+    if fn is None:
+        return None
+    if fn.type == "identifier" and text(src, fn) == "urlopen":
+        url = _string_arg(src, call_node, 0)
+        return ("GET", url) if url else None
+    if fn.type != "attribute":
+        return None
+    tail = _dotted_tail(src, fn)
+    recv = _receiver(src, fn)
+    if recv not in HTTP_CLIENT_RECEIVERS:
+        return None
+    if tail in HTTP_METHODS:
+        url = _string_arg(src, call_node, 0)
+        return (tail.upper(), url) if url else None
+    if tail == "request":
+        verb = _string_arg(src, call_node, 0)
+        url = _string_arg(src, call_node, 1)
+        return (verb.upper(), url) if verb and url else None
+    return None
 
 
 def _import_full_name(src: bytes, node) -> str:
