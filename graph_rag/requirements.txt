@@ -1,0 +1,13 @@
+tree-sitter>=0.25
+tree-sitter-java>=0.23
+tree-sitter-python>=0.25
+neo4j>=6.0
+protobuf>=5.0          # read scip-python's index.scip (Stage 2 precise resolver)
+# dev-only (regenerate graph_rag/scip/scip_pb2.py): grpcio-tools
+# external tool (Python CALLS resolution): scip-python — install with:
+#   npm install --prefix scip_tooling @sourcegraph/scip-python@0.6.6
+
+# web UI (graph_rag/webapp)
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
