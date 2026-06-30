@@ -1,9 +1,23 @@
-"""Runtime configuration, read from environment with sane local defaults."""
+"""Runtime configuration, read from environment with sane local defaults.
+
+Importing this module loads the repo-root `.env` (if present) so every other
+module sees those values via `os.environ`. config is imported before llm/store
+in the CLI, so this runs before any module-level env read.
+"""
 from __future__ import annotations
 
 import os
 import shutil
 from dataclasses import dataclass
+
+# graph_rag/graph_rag/config.py -> repo root is two dirs up.
+_ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(_ENV_PATH)
+except ImportError:  # dotenv optional; real env vars still work
+    pass
 
 
 # npm shims the binary differently per OS: an extension-less script on

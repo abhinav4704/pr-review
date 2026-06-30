@@ -30,6 +30,11 @@ class GraphStore:
         with self._driver.session(database=self._cfg.database) as s:
             return s.run(query, **params).consume()
 
+    def read(self, query, **params) -> list[dict]:
+        """Run a read query and materialize the rows as plain dicts."""
+        with self._driver.session(database=self._cfg.database) as s:
+            return [r.data() for r in s.run(query, **params)]
+
     def bootstrap(self):
         self._run(
             f"CREATE CONSTRAINT code_node_id IF NOT EXISTS "
@@ -69,6 +74,21 @@ class GraphStore:
             )
             for i in range(0, len(rows), _BATCH):
                 self._run(q, rows=rows[i:i + _BATCH])
+
+    def write_semantics(self, rows: list[dict]):
+        """Patch semantic properties onto existing nodes by id.
+
+        Each row is {"id": ..., "props": {...}}. This is a targeted SET (not a
+        full node rewrite) so the deterministic structural props are untouched —
+        the semantic layer only annotates nodes the parser already wrote.
+        """
+        q = (
+            f"UNWIND $rows AS row "
+            f"MATCH (n:{SHARED_LABEL} {{id: row.id}}) "
+            f"SET n += row.props"
+        )
+        for i in range(0, len(rows), _BATCH):
+            self._run(q, rows=rows[i:i + _BATCH])
 
     def counts(self, repo: str) -> dict:
         with self._driver.session(database=self._cfg.database) as s:

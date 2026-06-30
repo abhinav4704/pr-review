@@ -2,6 +2,11 @@ tree-sitter>=0.25
 tree-sitter-java>=0.23
 tree-sitter-python>=0.25
 neo4j>=6.0
+python-dotenv>=1.0     # load .env (REPO_PATH/REPO_NAME/NEO4J_*/GRAPH_RAG_* + provider keys)
+anthropic>=0.49        # Phase 2 semantic enrichment, providers: anthropic / bedrock
+# semantic provider extras (install only the one you use):
+#   bedrock: pip install 'anthropic[bedrock]'   (AWS creds + AWS_REGION)
+#   openai:  pip install openai                 (OPENAI_API_KEY)
 protobuf>=5.0          # read scip-python's index.scip (Stage 2 precise resolver)
 # dev-only (regenerate graph_rag/scip/scip_pb2.py): grpcio-tools
 # external tool (Python CALLS resolution): scip-python — install with:
