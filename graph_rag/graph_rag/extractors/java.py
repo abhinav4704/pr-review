@@ -40,6 +40,22 @@ _REST_TEMPLATE_CALLS = {
     "put": "PUT", "delete": "DELETE",
 }
 
+_AUTH_REQUIRE_ANNOTATIONS = {
+    "Authenticated", "AuthenticationPrincipal", "LoginRequired",
+}
+_POLICY_ANNOTATIONS = {
+    "PreAuthorize", "Secured", "RolesAllowed", "PermissionsAllowed",
+}
+_EVENT_CONSUMER_ANNOTATIONS = {
+    "KafkaListener", "RabbitListener", "JmsListener", "SqsListener",
+}
+_EVENT_EMIT_METHODS = {
+    "publish", "emit", "send", "produce", "dispatch", "publishEvent",
+}
+_EVENT_CONSUME_METHODS = {
+    "subscribe", "consume", "listen", "registerListener", "on",
+}
+
 _TYPE_DECLS = {
     "class_declaration": "class",
     "interface_declaration": "interface",
@@ -72,12 +88,23 @@ def extract(file: FileInfo, repo: str):
             evidence_col=child_node.start_point[1],
         ))
 
-    def ref(rtype, src_id, target, kind_hint, node, recv="", call_arity=-1):
+    def defines(container_id: str, child_node, child_id: str):
+        # Add semantic ownership without replacing structural containment.
+        edges.append(Edge(
+            "DEFINES", container_id, child_id,
+            origin=Origin.EXTRACTED.value, extractor=EXTRACTOR,
+            evidence_file=file.relpath,
+            evidence_line=child_node.start_point[0] + 1,
+            evidence_col=child_node.start_point[1],
+        ))
+
+    def ref(rtype, src_id, target, kind_hint, node, recv="", call_arity=-1, arg_names=None):
         refs.append(RawRef(
             rtype, src_id, target, kind_hint, recv=recv,
             ref_file=file.relpath,
             ref_line=node.start_point[0] + 1, ref_col=node.start_point[1],
             call_arity=call_arity,
+            arg_names=list(arg_names or []),
         ))
 
     def emit_endpoint(method, route, handler_id, ev_node):
@@ -161,8 +188,11 @@ def extract(file: FileInfo, repo: str):
             extractor=EXTRACTOR,
         ))
         contains(container_id, node, cid)
+        defines(container_id, node, cid)
         for ann in anns:
             ref("ANNOTATED_WITH", cid, ann, "annotation", node)
+        for et in _java_auth_policy_specs(src, node):
+            ref(et[0], cid, et[1], "policy", node)
 
         sc = node.child_by_field_name("superclass")
         if sc:
@@ -217,8 +247,13 @@ def extract(file: FileInfo, repo: str):
             body_hash=body_hash(text(src, node)), extractor=EXTRACTOR,
         ))
         contains(class_id, node, mid)
+        defines(class_id, node, mid)
         for ann in anns:
             ref("ANNOTATED_WITH", mid, ann, "annotation", node)
+        for et in _java_auth_policy_specs(src, node):
+            ref(et[0], mid, et[1], "policy", node)
+        for topic in _java_event_consumer_topics(src, node):
+            ref("CONSUMES_EVENT", mid, topic, "event", node)
         for method, route in _spring_endpoints(src, node, route_prefix):
             emit_endpoint(method, route, mid, node)
         # type edges: return type + parameter types
@@ -249,6 +284,7 @@ def extract(file: FileInfo, repo: str):
                 if d.type == "method_invocation":
                     nm = d.child_by_field_name("name")
                     if nm:
+                        pass_args = _call_arg_names(src, d)
                         ref(
                             "CALLS",
                             mid,
@@ -257,9 +293,25 @@ def extract(file: FileInfo, repo: str):
                             d,
                             call_arity=_call_arity(d),
                         )
+                        if pass_args:
+                            ref(
+                                "PASSES",
+                                mid,
+                                text(src, nm),
+                                "call",
+                                d,
+                                call_arity=_call_arity(d),
+                                arg_names=pass_args,
+                            )
                         ob = _outbound_java(src, d, text(src, nm))
                         if ob is not None:
                             emit_api_call(mid, ob[0], ob[1], d)
+                        ev = _outbound_event_java(src, d, text(src, nm))
+                        if ev:
+                            ref("EMITS_EVENT", mid, ev, "event", d)
+                        evc = _inbound_event_java(src, d, text(src, nm))
+                        if evc:
+                            ref("CONSUMES_EVENT", mid, evc, "event", d)
                 elif d.type == "object_creation_expression":
                     tp = d.child_by_field_name("type")
                     if tp:
@@ -296,6 +348,7 @@ def extract(file: FileInfo, repo: str):
                         return_type=ftype, extractor=EXTRACTOR,
                     ))
                     contains(class_id, node, fid)
+                    defines(class_id, node, fid)
                     if type_node is not None:
                         _emit_type(ref, "OF_TYPE", fid, src, type_node)
 
@@ -410,6 +463,24 @@ def _call_arity(call_node) -> int:
     return count
 
 
+def _call_arg_names(src: bytes, call_node) -> list[str]:
+    """Best-effort argument-name extraction for PASSES edges."""
+    out: list[str] = []
+    args = call_node.child_by_field_name("arguments")
+    if args is None:
+        return out
+    for c in args.children:
+        if c.type in ("(", ")", ","):
+            continue
+        if c.type == "identifier":
+            out.append(text(src, c))
+        elif c.type == "assignment_expression":
+            left = c.child_by_field_name("left")
+            if left is not None and left.type == "identifier":
+                out.append(text(src, left))
+    return out
+
+
 def _str_lit(src: bytes, node) -> str:
     """Literal value of a Java string_literal, without quotes."""
     if node.type != "string_literal":
@@ -503,6 +574,92 @@ def _outbound_java(src: bytes, call_node, name: str):
             verb = text(src, pos[1]).rsplit(".", 1)[-1].upper()
         return verb, url
     return None
+
+
+def _outbound_event_java(src: bytes, call_node, name: str) -> str:
+    if name not in _EVENT_EMIT_METHODS:
+        return ""
+    return _first_string_arg(src, call_node, 0)
+
+
+def _inbound_event_java(src: bytes, call_node, name: str) -> str:
+    if name not in _EVENT_CONSUME_METHODS:
+        return ""
+    return _first_string_arg(src, call_node, 0)
+
+
+def _first_string_arg(src: bytes, call_node, index: int) -> str:
+    args = call_node.child_by_field_name("arguments")
+    if args is None:
+        return ""
+    pos = [c for c in args.children if c.type not in ("(", ")", ",")]
+    if index >= len(pos) or pos[index].type != "string_literal":
+        return ""
+    return _str_lit(src, pos[index]).strip()
+
+
+def _java_auth_policy_specs(src: bytes, node) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for ann in _annotation_nodes(node):
+        nm = ann.child_by_field_name("name")
+        if nm is None:
+            continue
+        name = simple_type_name(text(src, nm))
+        low = name.lower()
+        if name in _AUTH_REQUIRE_ANNOTATIONS or "auth" in low:
+            out.append(("REQUIRES_AUTH", "AUTH_REQUIRED"))
+        if name in _POLICY_ANNOTATIONS or any(t in low for t in ("role", "permission", "policy", "scope", "authorize", "secured")):
+            target = _annotation_policy_value(src, ann) or name or "POLICY"
+            out.append(("ENFORCES_POLICY", target))
+    return out
+
+
+def _annotation_policy_value(src: bytes, ann_node) -> str:
+    args = ann_node.child_by_field_name("arguments")
+    if args is None:
+        return ""
+    for c in args.children:
+        if c.type == "string_literal":
+            return _str_lit(src, c)
+        if c.type == "element_value_pair":
+            val = c.child_by_field_name("value")
+            if val is not None and val.type == "string_literal":
+                return _str_lit(src, val)
+    return ""
+
+
+def _java_event_consumer_topics(src: bytes, node) -> list[str]:
+    out: list[str] = []
+    for ann in _annotation_nodes(node):
+        nm = ann.child_by_field_name("name")
+        if nm is None:
+            continue
+        name = simple_type_name(text(src, nm))
+        if name not in _EVENT_CONSUMER_ANNOTATIONS:
+            continue
+        args = ann.child_by_field_name("arguments")
+        if args is None:
+            continue
+        for c in args.children:
+            if c.type == "string_literal":
+                topic = _str_lit(src, c).strip()
+                if topic:
+                    out.append(topic)
+            elif c.type == "element_value_pair":
+                key = c.child_by_field_name("key")
+                val = c.child_by_field_name("value")
+                if key is None or val is None:
+                    continue
+                if text(src, key) in ("topic", "topics", "queue", "queues", "destination", "value"):
+                    if val.type == "string_literal":
+                        topic = _str_lit(src, val).strip()
+                        if topic:
+                            out.append(topic)
+    dedup: list[str] = []
+    for t in out:
+        if t not in dedup:
+            dedup.append(t)
+    return dedup
 
 
 def _types_in(src: bytes, node):

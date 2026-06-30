@@ -19,10 +19,14 @@ NODE_LABELS = {
     "Field",
     "Annotation",
     "Endpoint",     # an HTTP endpoint (method + route); in-repo or external
+    "Event",        # an event/topic/queue semantic node
+    "Policy",       # auth/policy contract node (role/scope/policy marker)
 }
 
 EDGE_TYPES = {
     "CONTAINS",
+    "BELONGS_TO",  # node -> Module ownership relation
+    "DEFINES",      # semantic ownership/provenance (file/class defines symbol)
     "IMPORTS",
     "CALLS",
     "INSTANTIATES",
@@ -43,6 +47,17 @@ EDGE_TYPES = {
     # HTTP-API layer
     "EXPOSES",      # Function -> Endpoint (backend handler serves this route)
     "CALLS_API",    # Function -> Endpoint (outbound HTTP call to this route)
+    # Flexible dependency layer (additive, lower-trust by default)
+    "REFERENCES",   # generic symbol use when stricter typing is unavailable
+    "USES",         # higher-level/component dependency
+    "PASSES",       # argument/data propagation hint (lightweight, not full DFG)
+    "AUTOWIRED",    # dependency-injection wiring relation
+    "RE_EXPORTS",   # symbol forwarding/export indirection (mainly JS/TS ecosystems)
+    # Event/auth layer
+    "EMITS_EVENT",      # Function -> Event (publishes to topic/queue)
+    "CONSUMES_EVENT",   # Function -> Event (subscribes/listens to topic/queue)
+    "REQUIRES_AUTH",    # Function/Class -> Policy (auth requirement)
+    "ENFORCES_POLICY",  # Function/Class -> Policy (authorization rule)
 }
 
 

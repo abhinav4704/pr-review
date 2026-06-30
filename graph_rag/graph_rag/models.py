@@ -76,6 +76,11 @@ class Node:
     fan_in: int = 0
     fan_out: int = 0
     recursive: bool = False
+    # derived architecture metadata
+    component_role: str = ""          # controller|service|repository|entity|config|util|...
+    role_source: str = ""             # annotation|name_suffix|package|fallback
+    role_confidence: str = ""         # HIGH|MEDIUM|LOW
+    module_id: str = ""               # owning Module node id (derived)
     # provenance
     extractor: str = ""              # who produced this node (tree-sitter)
     confidence: str = Confidence.EXTRACTED.value
@@ -117,6 +122,10 @@ class Node:
             "fan_in": self.fan_in,
             "fan_out": self.fan_out,
             "recursive": self.recursive,
+            "component_role": self.component_role,
+            "role_source": self.role_source,
+            "role_confidence": self.role_confidence,
+            "module_id": self.module_id,
             "extractor": self.extractor,
             "confidence": self.confidence,
         })
@@ -135,6 +144,7 @@ class Edge:
     evidence_line: int = 0           # 1-based
     evidence_col: int = 0            # 0-based
     strategy: str = ""              # resolver strategy used for destination selection
+    arg_names: list[str] = field(default_factory=list)  # lightweight arg-flow payload (PASSES)
 
     def props(self) -> dict:
         return _clean({
@@ -145,6 +155,7 @@ class Edge:
             "evidence_line": self.evidence_line,
             "evidence_col": self.evidence_col,
             "strategy": self.strategy,
+            "arg_names": self.arg_names,
         })
 
 
@@ -164,3 +175,4 @@ class RawRef:
     ref_line: int = 0   # 1-based
     ref_col: int = 0    # 0-based
     call_arity: int = -1
+    arg_names: list[str] = field(default_factory=list)  # optional arg names for PASSES

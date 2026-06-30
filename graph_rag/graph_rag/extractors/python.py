@@ -64,6 +64,16 @@ def extract(file: FileInfo, repo: str):
             evidence_col=child_node.start_point[1],
         ))
 
+    def defines(container_id: str, child_node, child_id: str):
+        # Add semantic ownership without replacing structural containment.
+        edges.append(Edge(
+            "DEFINES", container_id, child_id,
+            origin=Origin.EXTRACTED.value, extractor=EXTRACTOR,
+            evidence_file=file.relpath,
+            evidence_line=child_node.start_point[0] + 1,
+            evidence_col=child_node.start_point[1],
+        ))
+
     def ref(
         rtype,
         src_id,
@@ -74,6 +84,7 @@ def extract(file: FileInfo, repo: str):
         call_arity=-1,
         recv_type="",
         import_fqn="",
+        arg_names=None,
     ):
         refs.append(RawRef(
             rtype, src_id, target, kind_hint, recv=recv,
@@ -82,6 +93,7 @@ def extract(file: FileInfo, repo: str):
             ref_file=file.relpath,
             ref_line=node.start_point[0] + 1, ref_col=node.start_point[1],
             call_arity=call_arity,
+            arg_names=list(arg_names or []),
         ))
 
     def emit_endpoint(method, route, handler_id, ev_node):
@@ -153,8 +165,11 @@ def extract(file: FileInfo, repo: str):
             extractor=EXTRACTOR,
         ))
         contains(container_id, node, cid)
+        defines(container_id, node, cid)
         for dname, dnode in decos:
             ref("ANNOTATED_WITH", cid, dname, "annotation", dnode)
+            for et in _auth_specs(dname, src, dnode):
+                ref(et[0], cid, et[1], "policy", dnode)
         supers = node.child_by_field_name("superclasses")
         if supers:
             for c in supers.children:
@@ -202,8 +217,14 @@ def extract(file: FileInfo, repo: str):
             body_hash=body_hash(text(src, node)), extractor=EXTRACTOR,
         ))
         contains(container_id, node, mid)
+        defines(container_id, node, mid)
         for dname, dnode in decos:
             ref("ANNOTATED_WITH", mid, dname, "annotation", dnode)
+            for et in _auth_specs(dname, src, dnode):
+                ref(et[0], mid, et[1], "policy", dnode)
+            topic = _event_consumer_topic(dname, src, dnode)
+            if topic:
+                ref("CONSUMES_EVENT", mid, topic, "event", dnode)
             for method, route in _endpoint_specs(src, dnode):
                 emit_endpoint(method, route, mid, dnode)
         # type edges: return annotation + parameter annotations
@@ -224,6 +245,7 @@ def extract(file: FileInfo, repo: str):
                 if fn is not None:
                     callee = _dotted_tail(src, fn)
                     if callee:
+                        pass_args = _pass_arg_names(src, d)
                         ref(
                             "CALLS",
                             mid,
@@ -234,9 +256,27 @@ def extract(file: FileInfo, repo: str):
                             call_arity=_call_arity(d),
                             recv_type=_infer_receiver_type(src, fn, receiver_types),
                         )
+                        if pass_args:
+                            ref(
+                                "PASSES",
+                                mid,
+                                callee,
+                                "call",
+                                fn,
+                                recv=_receiver(src, fn),
+                                call_arity=_call_arity(d),
+                                recv_type=_infer_receiver_type(src, fn, receiver_types),
+                                arg_names=pass_args,
+                            )
                     ob = _outbound_call(src, d)
                     if ob is not None:
                         emit_api_call(mid, ob[0], ob[1], fn)
+                    ev = _outbound_event(src, d)
+                    if ev:
+                        ref("EMITS_EVENT", mid, ev, "event", fn)
+                    evc = _inbound_event(src, d)
+                    if evc:
+                        ref("CONSUMES_EVENT", mid, evc, "event", fn)
             _emit_exceptions(body, mid)
             if in_class:
                 _emit_state(body, mid, parent_fqn, container_id)
@@ -281,6 +321,7 @@ def extract(file: FileInfo, repo: str):
                         extractor=EXTRACTOR,
                     ))
                     contains(class_id, stmt, fid)
+                    defines(class_id, stmt, fid)
                     if type_node is not None:
                         _emit_type(ref, "OF_TYPE", fid, src, type_node)
 
@@ -314,6 +355,7 @@ def extract(file: FileInfo, repo: str):
                 end_line=node.end_point[0] + 1, end_col=node.end_point[1],
                 visibility=_visibility(name), extractor=EXTRACTOR))
             contains(class_id, node, fid)
+            defines(class_id, node, fid)
         return fid
 
     def _emit_state(body, fn_id, class_fqn, class_id):
@@ -589,6 +631,24 @@ def _string_arg(src: bytes, call_node, index: int) -> str:
     return ""
 
 
+def _pass_arg_names(src: bytes, call_node) -> list[str]:
+    """Best-effort argument-name extraction for PASSES edges."""
+    out: list[str] = []
+    args = call_node.child_by_field_name("arguments")
+    if args is None:
+        return out
+    for c in args.children:
+        if c.type in ("(", ")", ","):
+            continue
+        if c.type == "identifier":
+            out.append(text(src, c))
+        elif c.type == "keyword_argument":
+            name = c.child_by_field_name("name")
+            if name is not None:
+                out.append(text(src, name))
+    return out
+
+
 def _methods_kwarg(src: bytes, call_node) -> list[str]:
     """HTTP verbs from a `methods=[...]` keyword arg (Flask-style routes)."""
     args = call_node.child_by_field_name("arguments")
@@ -653,6 +713,75 @@ def _outbound_call(src: bytes, call_node):
         url = _string_arg(src, call_node, 1)
         return (verb.upper(), url) if verb and url else None
     return None
+
+
+_AUTH_REQUIRE_DECORATORS = {
+    "login_required", "requires_auth", "auth_required", "authenticated",
+}
+_POLICY_DECORATOR_TOKENS = {
+    "preauthorize", "roles_allowed", "permissions_required",
+    "require_permission", "require_role", "policy",
+}
+_EVENT_CONSUMER_DECORATORS = {
+    "kafka_listener", "rabbit_listener", "subscriber", "subscribe",
+    "consumer", "event_handler", "sqs_listener", "jms_listener",
+}
+_EVENT_EMIT_CALLS = {
+    "emit", "publish", "produce", "send", "send_event", "publish_event",
+    "dispatch", "dispatch_event",
+}
+_EVENT_CONSUME_CALLS = {
+    "subscribe", "consume", "listen", "add_listener", "on",
+}
+
+
+def _auth_specs(dname: str, src: bytes, deco_node) -> list[tuple[str, str]]:
+    lower = (dname or "").lower()
+    out: list[tuple[str, str]] = []
+    if lower in _AUTH_REQUIRE_DECORATORS or "auth" in lower:
+        out.append(("REQUIRES_AUTH", "AUTH_REQUIRED"))
+    if lower in _POLICY_DECORATOR_TOKENS or any(t in lower for t in ("role", "permission", "policy", "scope")):
+        target = _decorator_policy_target(src, deco_node) or dname or "POLICY"
+        out.append(("ENFORCES_POLICY", target))
+    return out
+
+
+def _decorator_policy_target(src: bytes, deco_node) -> str:
+    expr = deco_node.children[1] if len(deco_node.children) > 1 else None
+    if expr is None or expr.type != "call":
+        return ""
+    s = _string_arg(src, expr, 0)
+    return s.strip() if s else ""
+
+
+def _event_consumer_topic(dname: str, src: bytes, deco_node) -> str:
+    lower = (dname or "").lower()
+    if lower not in _EVENT_CONSUMER_DECORATORS and "listener" not in lower and "consumer" not in lower:
+        return ""
+    expr = deco_node.children[1] if len(deco_node.children) > 1 else None
+    if expr is None or expr.type != "call":
+        return ""
+    return _string_arg(src, expr, 0).strip()
+
+
+def _outbound_event(src: bytes, call_node) -> str:
+    fn = call_node.child_by_field_name("function")
+    if fn is None:
+        return ""
+    tail = _dotted_tail(src, fn).lower()
+    if tail not in _EVENT_EMIT_CALLS:
+        return ""
+    return _string_arg(src, call_node, 0).strip()
+
+
+def _inbound_event(src: bytes, call_node) -> str:
+    fn = call_node.child_by_field_name("function")
+    if fn is None:
+        return ""
+    tail = _dotted_tail(src, fn).lower()
+    if tail not in _EVENT_CONSUME_CALLS:
+        return ""
+    return _string_arg(src, call_node, 0).strip()
 
 
 def _import_full_name(src: bytes, node) -> str:

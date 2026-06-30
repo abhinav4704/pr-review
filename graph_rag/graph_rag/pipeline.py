@@ -81,6 +81,12 @@ def index_repo(root: str, repo: str, store: GraphStore, wipe: bool = True,
     all_nodes.extend(pkg_nodes)
     all_edges.extend(pkg_edges)
 
+    _classify_roles(all_nodes, all_edges)
+    mod_nodes, mod_edges, uses_edges = _derive_module_ownership_and_uses(all_nodes, all_edges, repo)
+    all_nodes.extend(mod_nodes)
+    all_edges.extend(mod_edges)
+    all_edges.extend(uses_edges)
+
     _attach_call_metrics(all_nodes, all_edges)
     validation = validate_graph(all_nodes, all_edges)
 
@@ -222,3 +228,215 @@ def _attach_call_metrics(nodes: list[Node], edges: list[Edge]) -> None:
         n.fan_out = fan_out.get(node_id, 0)
         n.fan_in = fan_in.get(node_id, 0)
         n.recursive = node_id in recursive
+
+
+def _classify_roles(nodes: list[Node], edges: list[Edge]) -> None:
+    """Deterministic component-role tagging from annotations/name/package signals."""
+    by_id = {n.id: n for n in nodes}
+    parent_of: dict[str, str] = {}
+    for e in edges:
+        if e.type == "CONTAINS":
+            parent_of[e.dst] = e.src
+
+    ann_by_src: dict[str, set[str]] = defaultdict(set)
+    exposes_src: set[str] = set()
+    for e in edges:
+        if e.type == "ANNOTATED_WITH":
+            dst = by_id.get(e.dst)
+            if dst and dst.label == "Annotation":
+                ann_by_src[e.src].add(dst.name.lower())
+        elif e.type == "EXPOSES":
+            exposes_src.add(e.src)
+
+    def assign(n: Node, role: str, source: str, confidence: str) -> None:
+        n.component_role = role
+        n.role_source = source
+        n.role_confidence = confidence
+
+    for n in nodes:
+        if n.label == "Class":
+            anns = ann_by_src.get(n.id, set())
+            name = (n.name or "").lower()
+            pkg = (n.package or "").lower()
+            if any(a in anns for a in ("restcontroller", "controller")):
+                assign(n, "controller", "annotation", "HIGH")
+            elif "service" in anns:
+                assign(n, "service", "annotation", "HIGH")
+            elif "repository" in anns:
+                assign(n, "repository", "annotation", "HIGH")
+            elif any(a in anns for a in ("configuration", "configurationproperties")):
+                assign(n, "config", "annotation", "HIGH")
+            elif "entity" in anns:
+                assign(n, "entity", "annotation", "HIGH")
+            elif name.endswith("controller"):
+                assign(n, "controller", "name_suffix", "MEDIUM")
+            elif name.endswith("service"):
+                assign(n, "service", "name_suffix", "MEDIUM")
+            elif name.endswith("repository") or name.endswith("dao"):
+                assign(n, "repository", "name_suffix", "MEDIUM")
+            elif name.endswith("config") or ".config" in pkg:
+                assign(n, "config", "name_or_package", "MEDIUM")
+            elif name.endswith("util") or name.endswith("utils"):
+                assign(n, "util", "name_suffix", "LOW")
+            elif ".controller" in pkg:
+                assign(n, "controller", "package", "LOW")
+            elif ".service" in pkg:
+                assign(n, "service", "package", "LOW")
+            elif ".repo" in pkg or ".repository" in pkg:
+                assign(n, "repository", "package", "LOW")
+
+    for n in nodes:
+        if n.label != "Function":
+            continue
+        if n.id in exposes_src:
+            assign(n, "endpoint_handler", "edge_exposes", "HIGH")
+            continue
+        cur = parent_of.get(n.id)
+        while cur is not None:
+            p = by_id.get(cur)
+            if p is None:
+                break
+            if p.label == "Class" and p.component_role:
+                assign(n, p.component_role, "owner_class", "MEDIUM")
+                break
+            cur = parent_of.get(cur)
+
+
+def _derive_module_ownership_and_uses(
+    nodes: list[Node],
+    edges: list[Edge],
+    repo: str,
+) -> tuple[list[Node], list[Edge], list[Edge]]:
+    """Derive Module ownership and aggregate low-level deps into USES.
+
+    Output edges are additive and deterministic.
+    """
+    by_id = {n.id: n for n in nodes}
+    parent_of: dict[str, str] = {}
+    for e in edges:
+        if e.type == "CONTAINS":
+            parent_of[e.dst] = e.src
+
+    module_nodes: list[Node] = []
+    ownership_edges: list[Edge] = []
+    uses_edges: list[Edge] = []
+
+    seen_mod_nodes: set[str] = set()
+    seen_mod_edges: set[tuple[str, str]] = set()
+    existing_edge_keys: set[tuple[str, str, str]] = {(e.type, e.src, e.dst) for e in edges}
+
+    def module_key_for(n: Node) -> str:
+        if n.package:
+            return n.package.split(".")[0]
+        if n.file:
+            f = n.file.replace("\\", "/")
+            parts = [p for p in f.split("/") if p]
+            if parts:
+                return parts[0].replace(".py", "").replace(".java", "")
+        return ""
+
+    allowed_owned_labels = {
+        "File", "Class", "Function", "Field", "Endpoint", "Event", "Policy", "Annotation",
+    }
+    for n in nodes:
+        if n.label not in allowed_owned_labels:
+            continue
+        mkey = module_key_for(n)
+        if not mkey:
+            continue
+        mid = make_id(repo, f"module:{mkey}", "module")
+        if mid not in seen_mod_nodes and mid not in by_id:
+            seen_mod_nodes.add(mid)
+            module_nodes.append(Node(
+                id=mid, label="Module", name=mkey, fqn=f"module:{mkey}",
+                repo=repo, kind="module", package=mkey,
+                extractor="derivation", confidence=Confidence.INFERRED.value,
+            ))
+        n.module_id = mid
+        k = (n.id, mid)
+        if k in seen_mod_edges or ("BELONGS_TO", n.id, mid) in existing_edge_keys:
+            continue
+        seen_mod_edges.add(k)
+        ownership_edges.append(Edge(
+            "BELONGS_TO", n.id, mid,
+            confidence=Confidence.INFERRED.value,
+            origin=Origin.DERIVED.value,
+            extractor="derivation",
+            strategy="module_from_package_or_path",
+            evidence_file=n.file,
+            evidence_line=n.start_line,
+        ))
+
+    # Re-index after appending derived modules.
+    by_id = {n.id: n for n in [*nodes, *module_nodes]}
+
+    def owner_component(node_id: str) -> str | None:
+        cur = node_id
+        while cur is not None:
+            n = by_id.get(cur)
+            if n is None:
+                return None
+            if n.label in ("Class", "File", "Endpoint", "Module"):
+                return cur
+            cur = parent_of.get(cur)
+        return None
+
+    base_dep_types = {
+        "CALLS", "PASSES", "READS", "WRITES", "IMPORTS", "INSTANTIATES",
+        "CALLS_API", "REFERENCES", "EMITS_EVENT", "CONSUMES_EVENT",
+        "REQUIRES_AUTH", "ENFORCES_POLICY", "EXTENDS", "IMPLEMENTS", "OVERRIDES",
+    }
+
+    comp_uses_support: dict[tuple[str, str], Edge] = {}
+    for e in edges:
+        if e.type not in base_dep_types:
+            continue
+        s = owner_component(e.src)
+        d = owner_component(e.dst)
+        if not s or not d or s == d:
+            continue
+        k = (s, d)
+        if k not in comp_uses_support:
+            comp_uses_support[k] = e
+
+    for (s, d), support in comp_uses_support.items():
+        if ("USES", s, d) in existing_edge_keys:
+            continue
+        uses_edges.append(Edge(
+            "USES", s, d,
+            confidence=Confidence.INFERRED.value,
+            origin=Origin.DERIVED.value,
+            extractor="derivation",
+            strategy="component_aggregate",
+            evidence_file=support.evidence_file,
+            evidence_line=support.evidence_line,
+            evidence_col=support.evidence_col,
+        ))
+        existing_edge_keys.add(("USES", s, d))
+
+    # Module-level USES from component USES ownership.
+    module_uses_pairs: set[tuple[str, str]] = set()
+    for e in uses_edges:
+        src_n = by_id.get(e.src)
+        dst_n = by_id.get(e.dst)
+        if src_n is None or dst_n is None:
+            continue
+        sm = src_n.module_id
+        dm = dst_n.module_id
+        if not sm or not dm or sm == dm:
+            continue
+        module_uses_pairs.add((sm, dm))
+
+    for sm, dm in module_uses_pairs:
+        if ("USES", sm, dm) in existing_edge_keys:
+            continue
+        uses_edges.append(Edge(
+            "USES", sm, dm,
+            confidence=Confidence.INFERRED.value,
+            origin=Origin.DERIVED.value,
+            extractor="derivation",
+            strategy="module_aggregate",
+        ))
+        existing_edge_keys.add(("USES", sm, dm))
+
+    return module_nodes, ownership_edges, uses_edges

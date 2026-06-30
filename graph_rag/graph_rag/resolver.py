@@ -192,19 +192,28 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
 
     extra_nodes: list[Node] = []
     annotation_ids: dict[str, str] = {}
+    event_ids: dict[str, str] = {}
+    policy_ids: dict[str, str] = {}
     api_endpoint_ids: set[str] = set()
     out_edges: list[Edge] = []
     coverage: dict[str, Coverage] = defaultdict(Coverage)
 
-    def make_edge(ref: RawRef, dst: str, confidence: str, strategy: str = "") -> Edge:
+    def make_edge(
+        ref: RawRef,
+        dst: str,
+        confidence: str,
+        strategy: str = "",
+        edge_type: str | None = None,
+    ) -> Edge:
         # Heuristic edges are still EXTRACTED-origin (the reference is observed in
         # source); the *resolution* uncertainty is carried by `confidence`.
         return Edge(
-            ref.type, ref.src, dst, confidence,
+            edge_type or ref.type, ref.src, dst, confidence,
             origin=Origin.EXTRACTED.value, extractor="heuristic",
             evidence_file=ref.ref_file, evidence_line=ref.ref_line,
             evidence_col=ref.ref_col,
             strategy=strategy,
+            arg_names=ref.arg_names,
         )
 
     def emit(ref: RawRef, cov: Coverage, wanted: list[Node], confidence: str,
@@ -237,6 +246,39 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
                     fqn=f"@{ref.target_name}", repo=repo, kind="annotation",
                 ))
             out_edges.append(make_edge(ref, aid, Confidence.EXTRACTED.value, strategy="annotation"))
+            cov.resolved += 1
+            continue
+
+        if ref.type in ("EMITS_EVENT", "CONSUMES_EVENT"):
+            topic = _normalize_event_name(ref.target_name)
+            if not topic:
+                cov.unresolved += 1
+                continue
+            eid = event_ids.get(topic)
+            if eid is None:
+                eid = make_id(repo, f"event:{topic}", "event")
+                event_ids[topic] = eid
+                extra_nodes.append(Node(
+                    id=eid, label="Event", name=topic,
+                    fqn=f"event://{topic}", repo=repo, kind="event",
+                ))
+            out_edges.append(make_edge(ref, eid, Confidence.EXTRACTED.value, strategy="event_marker"))
+            cov.resolved += 1
+            continue
+
+        if ref.type in ("REQUIRES_AUTH", "ENFORCES_POLICY"):
+            pname = _normalize_policy_name(ref.target_name)
+            if not pname:
+                pname = "AUTH_REQUIRED" if ref.type == "REQUIRES_AUTH" else "POLICY"
+            pid = policy_ids.get(pname)
+            if pid is None:
+                pid = make_id(repo, f"policy:{pname}", "policy")
+                policy_ids[pname] = pid
+                extra_nodes.append(Node(
+                    id=pid, label="Policy", name=pname,
+                    fqn=f"policy://{pname}", repo=repo, kind="policy",
+                ))
+            out_edges.append(make_edge(ref, pid, Confidence.EXTRACTED.value, strategy="auth_marker"))
             cov.resolved += 1
             continue
 
@@ -276,7 +318,7 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
                 cov.resolved += 1
             continue
 
-        if ref.type == "CALLS":
+        if ref.type in ("CALLS", "PASSES"):
             wanted, strategy = narrow_call(ref)
             emit(
                 ref,
@@ -286,6 +328,36 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
                 known_in_repo=ref.target_name in by_name,
                 strategy=strategy,
             )
+            if not wanted:
+                # Fallback: keep recall via a weaker symbol-use edge when a
+                # call target can't be resolved as a CALLS/PASSES destination.
+                fallback = _fallback_reference_candidates(ref.target_name, by_name)
+                if fallback:
+                    rcov = coverage["REFERENCES"]
+                    rcov.total += 1
+                    if len(fallback) == 1:
+                        out_edges.append(
+                            make_edge(
+                                ref,
+                                fallback[0].id,
+                                Confidence.INFERRED.value,
+                                strategy=f"{strategy or 'none'}+fallback_tail",
+                                edge_type="REFERENCES",
+                            )
+                        )
+                        rcov.resolved += 1
+                    else:
+                        for c in fallback:
+                            out_edges.append(
+                                make_edge(
+                                    ref,
+                                    c.id,
+                                    Confidence.AMBIGUOUS.value,
+                                    strategy=f"{strategy or 'none'}+fallback_tail",
+                                    edge_type="REFERENCES",
+                                )
+                            )
+                        rcov.ambiguous += 1
             continue
 
         if ref.type in ("READS", "WRITES"):
@@ -358,3 +430,36 @@ def _import_qualified_hits(candidates: list[Node], imported_fqns: set[str]) -> l
                 hits.append(c)
                 break
     return hits
+
+
+def _fallback_reference_candidates(
+    target_name: str,
+    by_name: dict[str, list[Node]],
+) -> list[Node]:
+    """Deterministic weak fallback for unresolved call-like refs.
+
+    If a dotted callee token doesn't resolve directly (e.g. pkg.mod.fn),
+    attempt tail-name matching and emit REFERENCES instead of dropping signal.
+    """
+    tail = _tail_name(target_name)
+    if not tail or tail == target_name:
+        return []
+    cands = by_name.get(tail, [])
+    if not cands:
+        return []
+    fns = [c for c in cands if c.label == "Function"]
+    return fns or cands
+
+
+def _normalize_event_name(name: str) -> str:
+    n = (name or "").strip().strip("\"'")
+    if not n:
+        return ""
+    return n
+
+
+def _normalize_policy_name(name: str) -> str:
+    n = (name or "").strip().strip("\"'")
+    if not n:
+        return ""
+    return n.upper()
