@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+.env
 scip_tooling/node_modules/
 scip_tooling/package*.json
 scip_out/

@@ -6,9 +6,12 @@ its native *structured-output* mode so the result is always schema-shaped — th
 "contract first, not prompt first" rule from SEMANTIC_LAYER.md.
 
 Providers (pick with --provider / GRAPH_RAG_LLM_PROVIDER):
-  anthropic — Claude via the Anthropic API        (ANTHROPIC_API_KEY)
-  bedrock   — Claude via Amazon Bedrock (Mantle)   (AWS creds + AWS_REGION)
-  openai    — GPT via the OpenAI API               (OPENAI_API_KEY)
+  anthropic — Claude via the Anthropic API             (ANTHROPIC_API_KEY)
+  bedrock   — Any Bedrock model via boto3 Converse API  (AWS creds + AWS_REGION)
+              Model prefix determines the call path:
+                anthropic.*  → Anthropic Messages API via AnthropicBedrockMantle
+                amazon.*     → boto3 converse + toolUse (Nova Pro, Nova Lite, etc.)
+  openai    — GPT via the OpenAI API                   (OPENAI_API_KEY)
 
 SDKs are imported lazily so the rest of the pipeline keeps working without any
 of them installed; the import error only surfaces when the semantic pass runs.
@@ -27,7 +30,7 @@ DEFAULT_PROVIDER = os.environ.get("GRAPH_RAG_LLM_PROVIDER", "anthropic")
 # tiering (cheap model for routine functions, strong one for class/repo synthesis).
 _DEFAULT_MODELS = {
     "anthropic": "claude-opus-4-8",
-    "bedrock": "anthropic.claude-opus-4-8",
+    "bedrock": "amazon.nova-pro-v1:0",
     "openai": "gpt-4o",
 }
 
@@ -55,9 +58,44 @@ class SemanticLLM:
         """Return JSON matching `schema`. Raises on transport/parse failure."""
         if self.provider == "openai":
             return self._openai_extract(system, user, schema)
-        return self._anthropic_extract(system, user, schema)  # anthropic + bedrock
+        if self.provider == "bedrock" and self.model.startswith("amazon."):
+            return self._boto3_extract(system, user, schema)
+        return self._anthropic_extract(system, user, schema)  # anthropic + bedrock claude
 
-    # --- Anthropic / Bedrock (same Messages + structured-output surface) -------
+    # --- boto3 native Bedrock Converse (amazon.* models: Nova Pro/Lite/Micro) ---
+    def _boto3_extract(self, system: str, user: str, schema: dict) -> dict:
+        """Use the Bedrock Converse API with toolUse to get structured output.
+        Works for amazon.nova-pro-v1:0, amazon.nova-lite-v1:0, etc."""
+        try:
+            import boto3  # noqa: PLC0415
+        except ImportError as e:
+            raise RuntimeError("bedrock (amazon.*) provider needs: pip install boto3") from e
+        region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+        if not region:
+            raise RuntimeError("set AWS_REGION for the bedrock provider")
+        client = boto3.client("bedrock-runtime", region_name=region)
+        response = client.converse(
+            modelId=self.model,
+            system=[{"text": system}],
+            messages=[{"role": "user", "content": [{"text": user}]}],
+            toolConfig={
+                "tools": [{
+                    "toolSpec": {
+                        "name": "extract",
+                        "description": "Extract structured semantic data from code.",
+                        "inputSchema": {"json": schema},
+                    }
+                }],
+                "toolChoice": {"tool": {"name": "extract"}},
+            },
+            inferenceConfig={"maxTokens": self.max_tokens},
+        )
+        for block in response.get("output", {}).get("message", {}).get("content", []):
+            if block.get("toolUse"):
+                return block["toolUse"]["input"]
+        raise RuntimeError(f"boto3 converse returned no toolUse block: {response}")
+
+    # --- Anthropic / Bedrock Claude (Messages + structured-output surface) -----
     def _anthropic_client(self):
         if self._client is not None:
             return self._client
