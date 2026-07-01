@@ -223,10 +223,48 @@ def node_detail(node_id: str):
     return {"node": n, "outgoing": out, "incoming": inc, "source": source}
 
 
+# --------------------------------------------------------------------- ask ---
+@app.post("/api/ask")
+def ask_question(repo: str = Form(...), question: str = Form(...),
+                 top_k: int = Form(8), expand: int = Form(5), use_llm: bool = Form(False)):
+    """Run the hybrid retrieval loop and return the full per-stage trace.
+
+    use_llm=false (default) runs retrieval only — no prune, no answer — so it
+    works with just the local embedder. use_llm=true runs the full loop and
+    needs LLM creds (ANTHROPIC_API_KEY / Bedrock AWS creds)."""
+    from graph_rag.embeddings import DEFAULT_EMBED_PROVIDER, Embedder, default_embed_model
+    from graph_rag.llm import SemanticLLM
+    from graph_rag.retrieval import ask as retrieval_ask
+
+    meta = _load_registry().get(repo) or {}
+    root = meta.get("root") or ""
+    store = GraphStore(_cfg)
+    embedder = Embedder(provider=DEFAULT_EMBED_PROVIDER,
+                        model=default_embed_model(DEFAULT_EMBED_PROVIDER))
+    llm = SemanticLLM() if use_llm else None
+    try:
+        res = retrieval_ask(question, repo, root, store, embedder, llm,
+                            top_k=top_k, expand_top=expand, log=lambda *_: None)
+    except Exception as e:
+        raise HTTPException(400, f"retrieval failed: {e}")
+    finally:
+        store.close()
+    return {
+        "question": res.question, "repo": res.repo, "answer": res.answer,
+        "citations": res.citations, "context_chars": res.context_chars,
+        "stages": [{"name": s.name, "note": s.note, "items": s.items} for s in res.stages],
+    }
+
+
 # ------------------------------------------------------------------- static --
 @app.get("/")
 def index():
     return FileResponse(os.path.join(STATIC, "index.html"))
+
+
+@app.get("/ask")
+def ask_page():
+    return FileResponse(os.path.join(STATIC, "ask.html"))
 
 
 app.mount("/static", StaticFiles(directory=STATIC), name="static")

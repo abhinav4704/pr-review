@@ -9,7 +9,25 @@ cheap* — GraphRAG over code as an alternative to fine-tuning, with verifiable 
 **What's built today:** a deterministic (no-LLM) pipeline that ingests a Java/Python repo
 and materializes it as a confidence-tagged, provenance-tracked **structural knowledge graph
 in Neo4j**. One command in, a queryable graph out. This is the compiler-grade structural
-foundation; the semantic/retrieval/agent layers are not built yet.
+foundation. On top of it, the **semantic + vector layers are built** (`semantic.py`,
+`embeddings.py`); **hybrid retrieval and the agent are not yet**.
+
+---
+
+## Where we are (2026-06-30)
+
+| Phase | State |
+|---|---|
+| **1 — Structural graph** | ✅ Built + tested (deterministic; events/auth/roles/modules/USES; REFERENCES reachable; `validate_fixtures.py` = 19/19) |
+| **2 — Semantic** | ✅ **Code complete, unverified live.** Identity (+`keywords`/`tags`/`concepts`) for every node, typed Implementation Flow per function. Cached by `body_hash` + schema version. |
+| **3 — Embeddings (vector leg)** | ✅ **Code complete, unverified live.** `cli embed` → identity-doc vector on each node + `code_embedding` cosine index. Local sentence-transformers default. |
+| **3 — Hybrid retrieval** | ⬜ Not built. All three legs are *available* (vector index, keyword fields, graph), but the retriever + context-pack loop is not written. |
+| **4–5 — Context builder / agent** | ⬜ Not built. |
+
+> **Honesty note:** Phases 2–3 are written, imported, and wired, but have **not** been
+> run end-to-end against a live Neo4j + embedding model + API key. Treat them as
+> "should work" until a real `index → semantic → embed` run confirms it. Next-step
+> ideas and known gaps live in [`IMPROVEMENTS.md`](IMPROVEMENTS.md).
 
 ---
 
@@ -24,9 +42,8 @@ discover ─► extract (tree-sitter) ─► resolve (SCIP + heuristic) ─► d
 
 ### Package map (`graph_rag/`)
 ```
-cli.py            entry: index <path> --repo NAME [--no-wipe] [--no-scip]
-                        [--validation-report FILE] [--fail-on-validation-error]
-pipeline.py       orchestrator: discover→extract→resolve→scip→overrides→packages→metrics→validate→write
+cli.py            entry: index | semantic | embed  (each --repo NAME, see RUN.md)
+pipeline.py       orchestrator: discover→extract→resolve→scip→overrides→packages→roles→modules/USES→metrics→validate→write
 discovery.py      Stage 0: walk repo, detect lang (.java/.py), hash → FileInfo
 languages.py      tree-sitter parser loading (Java + Python)
 extractors/
@@ -43,9 +60,16 @@ validator.py      M7: graph invariants (dangling edges, dup ids, ranges, require
 models.py         data model: Node, Edge, RawRef, Confidence, Origin, _clean()
 ids.py            stable id = sha1(repo+kind+fqn)[:16]; body_hash
 schema.py         allowlists for labels/edge-types (Cypher-injection guard)
-store.py          Neo4j writer: bootstrap, repo-scoped wipe, batched MERGE upserts
+store.py          Neo4j writer: bootstrap, repo-scoped wipe, batched MERGE upserts,
+                  write_semantics (patch props), create_vector_index (cosine)
 config.py         Neo4j connection + scip-python binary location (Windows .cmd/.ps1 aware)
+semantic.py       Phase 2: LLM Identity (+keywords/tags/concepts) per node + typed
+                  Implementation Flow per function; cached by body_hash + version
+llm.py            Phase 2: provider-agnostic structured-output wrapper (anthropic/bedrock/openai)
+embeddings.py     Phase 3: embed the identity doc → vector on node + Neo4j vector index
+                  (local sentence-transformers default; voyage/openai optional)
 measure_coverage.py   dev probe (no DB): heuristic coverage + old/new lift
+validate_fixtures.py  semantic/architecture edge regression (no DB): 19 checks
 scip_check.py     standalone SCIP smoke test (locate → --version → index a throwaway project)
 webapp/           deterministic browser UI (FastAPI + 1 static page)
 samples/          test fixtures (Sample.java, Shapes.java, api_sample.py)
@@ -211,8 +235,9 @@ MATCH (r:Repository {repo:'sail'})-[:CONTAINS*]->(p:Package) RETURN p.fqn;
 ## What is NOT built yet (the honest boundary)
 - **Java CALLS** still heuristic (scip-java needs Maven/Gradle).
 - **No JS/TS** extractor → the frontend→backend `CALLS_API` leg is unproduced.
-- **No semantic layer:** no summaries, embeddings, vector/hybrid search, context packs,
-  generation, incremental re-index, or export.
+- **Semantic layer built, but downstream of it is not:** Identity + Implementation Flow
+  generation exist (`semantic.py`); still missing are **embeddings / vector index**,
+  hybrid retrieval, context packs, generation (Job 2), incremental re-index, and export.
 - **No CFG/DFG/PDG** (Phase 6, off the critical path) and **canonical IR is a seam, not a full
   language-neutral model** yet.
 - **`Module` nodes** allowlisted but not emitted (would come from build files: pom/package.json/…).

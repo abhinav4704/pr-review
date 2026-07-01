@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codebase Brain — ask</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#272b34; --fg:#d6dae0;
+          --mut:#8a93a3; --acc:#5aa6ff; --ok:#46c08a; --warn:#e0a458; --amb:#e06a6a; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; gap:12px; align-items:center; padding:10px 14px;
+           border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header a { color:var(--acc); text-decoration:none; font-size:13px; }
+  header .grow { flex:1; }
+  select, input, button { background:#0c0e12; color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:6px 9px; font:inherit; }
+  button { cursor:pointer; } button:hover { border-color:var(--acc); }
+  button.primary { background:var(--acc); color:#04101f; border-color:var(--acc); font-weight:600; }
+  label.chk { color:var(--mut); font-size:12px; display:flex; gap:5px; align-items:center; cursor:pointer; }
+  main { max-width:940px; margin:0 auto; padding:18px 20px 60px; }
+  #bar { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  #bar input#q { flex:1; }
+  #status { font-size:12px; color:var(--mut); margin:4px 0 14px; }
+  .answer { background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--acc);
+            border-radius:8px; padding:14px 16px; margin:14px 0; white-space:pre-wrap; }
+  .answer .cites { margin-top:10px; font-size:12px; color:var(--mut); }
+  .cite { color:var(--acc); cursor:pointer; margin-right:10px; }
+  details { border:1px solid var(--line); border-radius:8px; margin:8px 0; background:var(--panel); }
+  details > summary { cursor:pointer; padding:10px 14px; font-weight:600; list-style:none;
+            display:flex; gap:10px; align-items:center; }
+  details > summary::-webkit-details-marker { display:none; }
+  details > summary .note { color:var(--mut); font-weight:400; font-size:12px; }
+  details > summary .count { margin-left:auto; color:var(--mut); font-size:12px; }
+  .stage-body { padding:2px 14px 12px; }
+  .item { padding:7px 9px; border:1px solid var(--line); border-radius:6px; margin:5px 0; cursor:pointer; }
+  .item:hover { border-color:var(--acc); }
+  .item .nm { font-weight:600; } .item .id { color:var(--mut); font-size:12px; }
+  .item .ident { color:var(--mut); font-size:12.5px; margin-top:2px; }
+  .badge { font-size:11px; padding:1px 6px; border-radius:10px; border:1px solid var(--line); color:var(--mut); margin-left:6px; }
+  .badge.Function { color:#7fb4ff; border-color:#274056; }
+  .badge.Class { color:#c79bff; border-color:#3a2c52; }
+  .rel { font-size:11px; color:var(--acc); margin-left:6px; }
+  .sc { font-size:11px; color:var(--warn); margin-left:6px; }
+  pre { background:#0a0c10; border:1px solid var(--line); border-radius:8px; padding:12px;
+        overflow:auto; font:12.5px/1.55 ui-monospace,Menlo,monospace; white-space:pre-wrap; }
+  dialog { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:10px;
+           width:min(720px,92vw); max-height:82vh; }
+  dialog h3 { margin:0 0 8px; } .muted { color:var(--mut); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧠 Codebase Brain — Ask</h1>
+  <select id="repo"></select>
+  <label class="chk"><input type="checkbox" id="usellm"> use LLM (prune + answer)</label>
+  <span class="grow"></span>
+  <a href="/">← browse graph</a>
+</header>
+
+<main>
+  <div id="bar">
+    <input id="q" placeholder="ask a question about this codebase…" onkeydown="if(event.key==='Enter')run()">
+    <button class="primary" onclick="run()">Ask</button>
+  </div>
+  <div id="status"></div>
+  <div id="out"></div>
+</main>
+
+<dialog id="node"><div id="nodebody"></div>
+  <div style="text-align:right;margin-top:12px"><button onclick="document.getElementById('node').close()">Close</button></div>
+</dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+async function api(path, opts) {
+  const r = await fetch('/api' + path, opts);
+  if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || r.statusText);
+  return r.json();
+}
+function esc(s){ return (s||'').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+async function loadRepos() {
+  const repos = await api('/repos');
+  $('#repo').innerHTML = repos.map(r=>`<option value="${r.name}">${r.name} (${r.nodes})</option>`).join('');
+}
+
+const STAGE_LABEL = {
+  candidates:'Step 1 · Hybrid candidates (vector + keyword)',
+  rerank:'Step 1 · Reranked (RRF fusion)',
+  prune_candidates:'Step 1 · After prune',
+  expand:'Step 2 · Neighbors (graph expansion)',
+  prune_neighbors:'Step 2 · Neighbors after prune',
+  answer:'Step 3 · Answer citations',
+};
+
+function itemRow(it) {
+  const rel = it.rel ? `<span class="rel">${it.dir||''} ${it.rel}</span>` : '';
+  const sc  = (it.score!==undefined && it.score!==null) ? `<span class="sc">${it.score}</span>` : '';
+  const legs = it.legs ? `<span class="rel">[${it.legs.join(',')}]</span>` : '';
+  return `<div class="item" onclick="openNode('${it.id}')">
+    <div><span class="nm">${esc(it.fqn||it.id)}</span>
+      <span class="badge ${it.label}">${it.label||''}</span>${rel}${sc}${legs}</div>
+    ${it.identity?`<div class="ident">${esc(it.identity)}</div>`:''}
+    <div class="id">${it.id}</div>
+  </div>`;
+}
+
+async function run() {
+  const repo = $('#repo').value, question = $('#q').value.trim();
+  if (!repo || !question) return;
+  const useLlm = $('#usellm').checked;
+  $('#status').textContent = 'retrieving…' + (useLlm?' (embed → rerank → prune → expand → answer)':' (embed → rerank → expand)');
+  $('#out').innerHTML = '';
+  const fd = new FormData();
+  fd.append('repo', repo); fd.append('question', question);
+  fd.append('use_llm', useLlm);
+  try {
+    const res = await api('/ask', {method:'POST', body:fd});
+    render(res);
+    $('#status').textContent = `${res.stages.length} stages · context ${res.context_chars} chars`;
+  } catch(e) { $('#status').textContent = 'error: ' + e.message; }
+}
+
+function render(res) {
+  let html = '';
+  if (res.answer) {
+    const cites = (res.citations||[]).map(c=>`<span class="cite" onclick="openNode('${c.id}')">${esc(c.fqn)}</span>`).join('');
+    html += `<div class="answer">${esc(res.answer)}${cites?`<div class="cites">cites: ${cites}</div>`:''}</div>`;
+  }
+  res.stages.forEach((s,i) => {
+    const open = (s.name==='candidates'||s.name==='rerank'||s.name==='expand') ? 'open' : '';
+    html += `<details ${open}>
+      <summary>${STAGE_LABEL[s.name]||s.name}
+        <span class="note">${esc(s.note)}</span>
+        <span class="count">${s.items.length}</span></summary>
+      <div class="stage-body">${s.items.map(itemRow).join('') || '<span class="muted">none</span>'}</div>
+    </details>`;
+  });
+  $('#out').innerHTML = html || '<p class="muted">no results — is the repo indexed + enriched (semantic/embed)?</p>';
+}
+
+async function openNode(id) {
+  const d = await api('/nodes/' + id);
+  const n = d.node;
+  $('#nodebody').innerHTML = `<h3>${esc(n.name)} <span class="badge ${n.label}">${n.label}</span></h3>
+    <div class="muted" style="word-break:break-all">${esc(n.fqn||'')}</div>
+    ${n.identity?`<p>${esc(n.identity)}</p>`:''}
+    <pre>${d.source?esc(d.source):'<span class="muted">source unavailable</span>'}</pre>`;
+  $('#node').showModal();
+}
+
+loadRepos();
+</script>
+</body>
+</html>

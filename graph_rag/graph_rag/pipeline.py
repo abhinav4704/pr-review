@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from . import extractors
@@ -27,6 +27,7 @@ class IndexResult:
     validation: dict = field(default_factory=dict)
     db_counts: dict = field(default_factory=dict)
     scip: ScipReport = field(default_factory=ScipReport)
+    roles: dict = field(default_factory=dict)  # (role, source) -> count diagnostics
 
 
 def index_repo(root: str, repo: str, store: GraphStore, wipe: bool = True,
@@ -81,7 +82,7 @@ def index_repo(root: str, repo: str, store: GraphStore, wipe: bool = True,
     all_nodes.extend(pkg_nodes)
     all_edges.extend(pkg_edges)
 
-    _classify_roles(all_nodes, all_edges)
+    role_diag = _classify_roles(all_nodes, all_edges)
     mod_nodes, mod_edges, uses_edges = _derive_module_ownership_and_uses(all_nodes, all_edges, repo)
     all_nodes.extend(mod_nodes)
     all_edges.extend(mod_edges)
@@ -106,6 +107,7 @@ def index_repo(root: str, repo: str, store: GraphStore, wipe: bool = True,
         validation=validation,
         db_counts=store.counts(repo),
         scip=scip_report,
+        roles={f"{role}:{source}": c for (role, source), c in role_diag.items()},
     )
 
 
@@ -230,8 +232,42 @@ def _attach_call_metrics(nodes: list[Node], edges: list[Edge]) -> None:
         n.recursive = node_id in recursive
 
 
-def _classify_roles(nodes: list[Node], edges: list[Edge]) -> None:
-    """Deterministic component-role tagging from annotations/name/package signals."""
+# Class component-role rules, highest precedence first. Each rule is
+# (match_kind, key, role, source, confidence):
+#   ann    -> annotation simple-name (lowercased) present on the class
+#   suffix -> class name ends with key
+#   pkg    -> key is a substring of the class's package
+# Edit this table to retune role classification — precedence is list order
+# (annotation > name suffix > package), the explicit mapping the design asked for.
+_CLASS_ROLE_RULES: list[tuple[str, str, str, str, str]] = [
+    ("ann", "restcontroller", "controller", "annotation", "HIGH"),
+    ("ann", "controller", "controller", "annotation", "HIGH"),
+    ("ann", "service", "service", "annotation", "HIGH"),
+    ("ann", "repository", "repository", "annotation", "HIGH"),
+    ("ann", "configuration", "config", "annotation", "HIGH"),
+    ("ann", "configurationproperties", "config", "annotation", "HIGH"),
+    ("ann", "entity", "entity", "annotation", "HIGH"),
+    ("suffix", "controller", "controller", "name_suffix", "MEDIUM"),
+    ("suffix", "service", "service", "name_suffix", "MEDIUM"),
+    ("suffix", "repository", "repository", "name_suffix", "MEDIUM"),
+    ("suffix", "dao", "repository", "name_suffix", "MEDIUM"),
+    ("suffix", "config", "config", "name_or_package", "MEDIUM"),
+    ("pkg", ".config", "config", "name_or_package", "MEDIUM"),
+    ("suffix", "util", "util", "name_suffix", "LOW"),
+    ("suffix", "utils", "util", "name_suffix", "LOW"),
+    ("pkg", ".controller", "controller", "package", "LOW"),
+    ("pkg", ".service", "service", "package", "LOW"),
+    ("pkg", ".repo", "repository", "package", "LOW"),
+    ("pkg", ".repository", "repository", "package", "LOW"),
+]
+
+
+def _classify_roles(nodes: list[Node], edges: list[Edge]) -> Counter:
+    """Deterministic component-role tagging from annotations/name/package signals.
+
+    Returns a diagnostics counter keyed by (role, source) so role-assignment
+    quality is observable (e.g. how many roles came from HIGH-confidence
+    annotations vs LOW-confidence package fallbacks)."""
     by_id = {n.id: n for n in nodes}
     parent_of: dict[str, str] = {}
     for e in edges:
@@ -248,42 +284,28 @@ def _classify_roles(nodes: list[Node], edges: list[Edge]) -> None:
         elif e.type == "EXPOSES":
             exposes_src.add(e.src)
 
+    diag: Counter = Counter()
+
     def assign(n: Node, role: str, source: str, confidence: str) -> None:
         n.component_role = role
         n.role_source = source
         n.role_confidence = confidence
+        diag[(role, source)] += 1
 
     for n in nodes:
-        if n.label == "Class":
-            anns = ann_by_src.get(n.id, set())
-            name = (n.name or "").lower()
-            pkg = (n.package or "").lower()
-            if any(a in anns for a in ("restcontroller", "controller")):
-                assign(n, "controller", "annotation", "HIGH")
-            elif "service" in anns:
-                assign(n, "service", "annotation", "HIGH")
-            elif "repository" in anns:
-                assign(n, "repository", "annotation", "HIGH")
-            elif any(a in anns for a in ("configuration", "configurationproperties")):
-                assign(n, "config", "annotation", "HIGH")
-            elif "entity" in anns:
-                assign(n, "entity", "annotation", "HIGH")
-            elif name.endswith("controller"):
-                assign(n, "controller", "name_suffix", "MEDIUM")
-            elif name.endswith("service"):
-                assign(n, "service", "name_suffix", "MEDIUM")
-            elif name.endswith("repository") or name.endswith("dao"):
-                assign(n, "repository", "name_suffix", "MEDIUM")
-            elif name.endswith("config") or ".config" in pkg:
-                assign(n, "config", "name_or_package", "MEDIUM")
-            elif name.endswith("util") or name.endswith("utils"):
-                assign(n, "util", "name_suffix", "LOW")
-            elif ".controller" in pkg:
-                assign(n, "controller", "package", "LOW")
-            elif ".service" in pkg:
-                assign(n, "service", "package", "LOW")
-            elif ".repo" in pkg or ".repository" in pkg:
-                assign(n, "repository", "package", "LOW")
+        if n.label != "Class":
+            continue
+        anns = ann_by_src.get(n.id, set())
+        name = (n.name or "").lower()
+        pkg = (n.package or "").lower()
+        for kind, key, role, source, conf in _CLASS_ROLE_RULES:
+            if (
+                (kind == "ann" and key in anns)
+                or (kind == "suffix" and name.endswith(key))
+                or (kind == "pkg" and key in pkg)
+            ):
+                assign(n, role, source, conf)
+                break
 
     for n in nodes:
         if n.label != "Function":
@@ -301,15 +323,30 @@ def _classify_roles(nodes: list[Node], edges: list[Edge]) -> None:
                 break
             cur = parent_of.get(cur)
 
+    return diag
+
 
 def _derive_module_ownership_and_uses(
     nodes: list[Node],
     edges: list[Edge],
     repo: str,
+    module_root_depth: int = 1,
+    module_roots: tuple[str, ...] = (),
 ) -> tuple[list[Node], list[Edge], list[Edge]]:
     """Derive Module ownership and aggregate low-level deps into USES.
 
-    Output edges are additive and deterministic.
+    Output edges are additive and deterministic. Module boundaries are
+    configurable rather than hard-wired to the first package segment:
+
+      - ``module_roots``: explicit module-root prefixes (longest match wins),
+        e.g. ``("com.acme.billing", "com.acme.orders")`` to model real modules
+        instead of guessing. Matched against the node's package or file path.
+      - ``module_root_depth``: when no explicit root matches, how many leading
+        package/path segments form the module key (default 1 = first segment,
+        the original behaviour).
+
+    Component-level USES carry a ``cross_module`` / ``intra_module`` strategy tag
+    so boundary-crossing dependencies (the blast-radius signal) are queryable.
     """
     by_id = {n.id: n for n in nodes}
     parent_of: dict[str, str] = {}
@@ -325,15 +362,28 @@ def _derive_module_ownership_and_uses(
     seen_mod_edges: set[tuple[str, str]] = set()
     existing_edge_keys: set[tuple[str, str, str]] = {(e.type, e.src, e.dst) for e in edges}
 
+    # Longest-prefix-first so a more specific root wins over a broader one.
+    roots = sorted(module_roots, key=len, reverse=True)
+
     def module_key_for(n: Node) -> str:
         if n.package:
-            return n.package.split(".")[0]
-        if n.file:
+            segs = [s for s in n.package.split(".") if s]
+        elif n.file:
             f = n.file.replace("\\", "/")
-            parts = [p for p in f.split("/") if p]
-            if parts:
-                return parts[0].replace(".py", "").replace(".java", "")
-        return ""
+            segs = [
+                p.replace(".py", "").replace(".java", "")
+                for p in f.split("/") if p
+            ]
+        else:
+            return ""
+        if not segs:
+            return ""
+        dotted = ".".join(segs)
+        for root in roots:
+            if dotted == root or dotted.startswith(root + "."):
+                return root
+        depth = max(1, module_root_depth)
+        return ".".join(segs[:depth])
 
     allowed_owned_labels = {
         "File", "Class", "Function", "Field", "Endpoint", "Event", "Policy", "Annotation",
@@ -399,15 +449,23 @@ def _derive_module_ownership_and_uses(
         if k not in comp_uses_support:
             comp_uses_support[k] = e
 
+    def module_of(node_id: str) -> str:
+        n = by_id.get(node_id)
+        if n is None:
+            return ""
+        return n.id if n.label == "Module" else n.module_id
+
     for (s, d), support in comp_uses_support.items():
         if ("USES", s, d) in existing_edge_keys:
             continue
+        sm, dm = module_of(s), module_of(d)
+        boundary = "cross_module" if (sm and dm and sm != dm) else "intra_module"
         uses_edges.append(Edge(
             "USES", s, d,
             confidence=Confidence.INFERRED.value,
             origin=Origin.DERIVED.value,
             extractor="derivation",
-            strategy="component_aggregate",
+            strategy=f"component_aggregate:{boundary}",
             evidence_file=support.evidence_file,
             evidence_line=support.evidence_line,
             evidence_col=support.evidence_col,

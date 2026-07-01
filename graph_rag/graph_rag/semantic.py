@@ -39,7 +39,8 @@ from .store import GraphStore
 LEVELS = ("function", "class", "package", "repository")
 
 # Bump when the artifact schema changes, so a later run can detect and migrate v1 nodes.
-SEMANTIC_VERSION = "v1"
+# v2 adds keywords/tags/concepts retrieval signals to every identity.
+SEMANTIC_VERSION = "v2"
 
 # Caps so a god-class / huge package can't blow the prompt or cost.
 _MAX_CLASS_METHODS = 40
@@ -61,16 +62,33 @@ SYSTEM_PROMPT = (
     "Your task is to extract MEANING: what the entity is and why it exists.\n"
     "Identity must be concise (1-2 sentences, implementation-independent), factual, "
     "and stable. Never invent information not supported by the provided context.\n"
+    "Also extract retrieval signals so this node is findable by keyword/concept "
+    "search, not just vectors:\n"
+    "  keywords — specific searchable terms: operations, technologies, protocols, "
+    "domain verbs (e.g. Authentication, JWT, Retry, Pagination).\n"
+    "  tags — coarse functional categories (e.g. security, persistence, api, "
+    "validation, messaging, config).\n"
+    "  concepts — domain entities/nouns this code is about (e.g. User, Order, "
+    "Session, Invoice).\n"
+    "Keep each list 3-8 items, deduplicated, no full sentences. Use [] if genuinely "
+    "none apply.\n"
     "Return only valid JSON matching the supplied schema."
 )
 
+# Retrieval-boost arrays make identities directly findable (keyword/BM25 + concept
+# filtering) alongside vector search — see SEMANTIC_LAYER.md. Stored as list
+# properties on the node; embeddings are a separate later pass.
+_STR_LIST = {"type": "array", "items": {"type": "string"}}
 _IDENTITY_SCHEMA = {
     "type": "object",
     "properties": {
         "identity": {"type": "string"},
+        "keywords": _STR_LIST,
+        "tags": _STR_LIST,
+        "concepts": _STR_LIST,
         "confidence": {"type": "number"},
     },
-    "required": ["identity", "confidence"],
+    "required": ["identity", "keywords", "tags", "concepts", "confidence"],
     "additionalProperties": False,
 }
 # Phase 2B — implementation flow as a typed, compressed execution graph.
@@ -239,6 +257,7 @@ OPTIONAL MATCH (f)-[:RETURNS]->(rt:Class)
 RETURN f.id AS id, f.name AS name, f.fqn AS fqn, f.signature AS signature,
        f.docstring AS docstring, f.file AS file, f.start_line AS start_line,
        f.end_line AS end_line, f.body_hash AS body_hash, f.semantic_hash AS semantic_hash,
+       f.semantic_version AS semantic_version,
        collect(DISTINCT callee.name) AS callees,
        collect(DISTINCT caller.name) AS callers,
        collect(DISTINCT rf.name) AS reads,
@@ -252,6 +271,7 @@ OPTIONAL MATCH (c)-[:CONTAINS]->(m:Function)
 OPTIONAL MATCH (c)-[:EXTENDS|IMPLEMENTS]->(sup:Class)
 RETURN c.id AS id, c.name AS name, c.fqn AS fqn, c.docstring AS docstring,
        c.body_hash AS body_hash, c.semantic_hash AS semantic_hash,
+       c.semantic_version AS semantic_version,
        collect(DISTINCT {name:m.name, identity:m.identity,
                          visibility:m.visibility, fan_in:m.fan_in}) AS methods,
        collect(DISTINCT sup.name) AS supers
@@ -282,9 +302,30 @@ _IDENTITY_SPEC = {
 }
 
 
+def _clean_terms(values, cap: int = 12) -> list[str]:
+    """Dedup (case-insensitive), trim, drop empties/sentences, cap length."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in values or []:
+        s = str(v).strip()
+        if not s or len(s) > 60:  # a term, not a sentence
+            continue
+        k = s.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(s)
+        if len(out) >= cap:
+            break
+    return out
+
+
 def _identity_props(data: dict, body_hash: str, llm: SemanticLLM) -> dict:
     return {
         "identity": (data.get("identity") or "").strip(),
+        "identity_keywords": _clean_terms(data.get("keywords")),
+        "identity_tags": _clean_terms(data.get("tags")),
+        "identity_concepts": _clean_terms(data.get("concepts")),
         "semantic_confidence": float(data.get("confidence") or 0.0),
         "semantic_model": llm.model,
         "semantic_provider": llm.provider,
@@ -307,7 +348,11 @@ def enrich_identities(repo: str, root: str, store: GraphStore, llm: SemanticLLM,
         out_rows: list[dict] = []
         for row in rows:
             body_hash = row.get("body_hash") or ""
-            if cacheable and not refresh and body_hash and row.get("semantic_hash") == body_hash:
+            fresh = (
+                row.get("semantic_hash") == body_hash
+                and row.get("semantic_version") == SEMANTIC_VERSION
+            )
+            if cacheable and not refresh and body_hash and fresh:
                 lr.cached += 1
                 continue
             if limit is not None and lr.generated >= limit:
@@ -356,6 +401,7 @@ _FLOW_SYSTEM_PROMPT = (
 _Q_FLOW_TARGETS = """
 MATCH (f:Function {repo:$repo})
 WHERE $refresh OR f.flow_hash IS NULL OR f.flow_hash <> f.body_hash
+   OR f.flow_version IS NULL OR f.flow_version <> $flow_version
 OPTIONAL MATCH (f)-[:CALLS]->(callee:Function)
 OPTIONAL MATCH (f)-[:THROWS]->(exc:Class)
 OPTIONAL MATCH (f)-[:CALLS_API]->(ep:Endpoint)
@@ -454,7 +500,7 @@ def generate_flows(repo: str, root: str, store: GraphStore, llm: SemanticLLM,
     hot) functions; otherwise it sweeps every function still lacking a fresh flow.
     Deliberately NOT part of `enrich_identities`.
     """
-    rows = store.read(_Q_FLOW_TARGETS, repo=repo, refresh=refresh)
+    rows = store.read(_Q_FLOW_TARGETS, repo=repo, refresh=refresh, flow_version=FLOW_VERSION)
     if ids is not None:
         wanted = set(ids)
         rows = [r for r in rows if r["id"] in wanted]

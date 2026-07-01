@@ -1,7 +1,10 @@
 # Next TODOs — Semantic Layer (Phase 2)
 
-> The structural graph is done. This is the plan for the **semantic enrichment** pass
-> (Stage 5 / Phase 2 in [`ARCHITECTURE.md`](ARCHITECTURE.md)). **Design doc only — no code yet.**
+> The structural graph is done. This is the design for the **semantic enrichment** pass
+> (Stage 5 / Phase 2 in [`ARCHITECTURE.md`](ARCHITECTURE.md)). **Implemented** in
+> `graph_rag/semantic.py` + `graph_rag/llm.py` (run via `cli semantic`, see
+> [`RUN.md`](RUN.md)): Identity (with `keywords`/`tags`/`concepts`) for every node, and
+> typed Implementation Flows per function. **Embeddings are the next pass — not built yet.**
 
 ## The one rule: contract first, not prompt first
 

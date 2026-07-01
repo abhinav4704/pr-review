@@ -320,6 +320,36 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
 
         if ref.type in ("CALLS", "PASSES"):
             wanted, strategy = narrow_call(ref)
+            # Precision guard: a call on an *unknown* receiver that matched only by
+            # global name (no scope/file/import/receiver-type evidence) is not a
+            # trustworthy CALLS — it likely targets an external object that merely
+            # shares a method name. Demote it to a weak REFERENCES symbol-use edge
+            # instead of asserting a precise call. Bare calls (no receiver) and the
+            # PASSES shadow are left untouched.
+            if (
+                ref.type == "CALLS"
+                and wanted
+                and strategy.startswith("name")
+                and ref.recv
+                and ref.recv not in ("self", "cls")
+            ):
+                cov.total -= 1  # this site is accounted under REFERENCES, not CALLS
+                rcov = coverage["REFERENCES"]
+                rcov.total += 1
+                if len(wanted) == 1:
+                    out_edges.append(make_edge(
+                        ref, wanted[0].id, Confidence.INFERRED.value,
+                        strategy=f"{strategy}+unknown_recv", edge_type="REFERENCES",
+                    ))
+                    rcov.resolved += 1
+                else:
+                    for c in wanted:
+                        out_edges.append(make_edge(
+                            ref, c.id, Confidence.AMBIGUOUS.value,
+                            strategy=f"{strategy}+unknown_recv", edge_type="REFERENCES",
+                        ))
+                    rcov.ambiguous += 1
+                continue
             emit(
                 ref,
                 cov,

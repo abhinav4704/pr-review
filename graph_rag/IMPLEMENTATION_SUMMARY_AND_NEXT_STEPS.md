@@ -78,26 +78,55 @@ This document summarizes the implementation work completed in this session and p
 
 ## Suggested Next Changes (Priority Order)
 
-### Priority 1: Validation fixtures and regression checks
-- Add compact synthetic samples that explicitly trigger:
-  - EMITS_EVENT, CONSUMES_EVENT
-  - REQUIRES_AUTH, ENFORCES_POLICY
-  - REFERENCES fallback
-  - BELONGS_TO and USES
-- Add assertions in test/coverage scripts so regressions are detected automatically.
+### Priority 1: Validation fixtures and regression checks ✅ DONE
+- Added compact synthetic fixtures under `fixtures/` (`orders/service.py`,
+  `billing/gateway.py`, `auth/SecuredController.java`) that explicitly trigger
+  EMITS_EVENT, CONSUMES_EVENT, REQUIRES_AUTH, ENFORCES_POLICY, PASSES, DEFINES,
+  BELONGS_TO, USES (incl. cross-module `orders -> billing`), plus Event/Policy/
+  Module node materialization and controller role tagging.
+- Added `validate_fixtures.py`: replays the DB-free pipeline (heuristic, no SCIP)
+  step-for-step over `fixtures/` and asserts each edge/node still fires, with a
+  graph-validity check. Exit 1 on regression. **19/19 checks pass** (after the
+  Priority 3/4 work below).
+- **Note — `@PreAuthorize` double-tags.** Its name contains the substring "auth",
+  so Java's `_java_auth_policy_specs` emits both REQUIRES_AUTH and ENFORCES_POLICY
+  for it. Harmless (additive), but worth a substring tightening if precision matters.
 
-### Priority 2: AUTOWIRED deterministic support (Java Spring first)
+### Priority 1b: REFERENCES made reachable (precision-aligned) ✅ DONE
+- Original finding: REFERENCES was unreachable via extraction — extractors emit a
+  *simple* call name, and `_fallback_reference_candidates` only fires on a *dotted*
+  target. It's a genuinely useful recall fallback for PR review, so rather than
+  drop it we made it fire correctly.
+- `resolver.py`: a CALLS on an **unknown receiver** (`recv` set, not `self`/`cls`)
+  that matched only by the weakest global-name strategy is now **demoted from CALLS
+  to a weak REFERENCES** symbol-use edge — it likely targets an external object that
+  merely shares a method name, so this *improves CALLS precision* while keeping the
+  recall signal. Bare calls and known-receiver calls are unchanged; coverage now
+  accounts the site under REFERENCES.
+- Verified no regression on `samples` (identical CALLS coverage); fixture
+  `audit/log.py` + `tracer.stamp(...)` locks the new path.
+
+### Priority 2: AUTOWIRED deterministic support (Java Spring first) — NEXT
 - Extract constructor/field/parameter injection signals.
 - Resolve injected type targets deterministically.
 - Add AUTOWIRED edges with clear provenance.
+- (scip-java precise Java CALLS deferred: needs Coursier + a buildable Maven/Gradle
+  project; no such toolchain/project present yet.)
 
-### Priority 3: Improve role classification determinism
-- Move role rules into an explicit, configurable mapping (annotation > suffix > package fallback).
-- Add per-rule counters/diagnostics to observe role assignment quality.
+### Priority 3: Improve role classification determinism ✅ DONE
+- Role rules moved into an explicit, ordered mapping `_CLASS_ROLE_RULES` in
+  `pipeline.py` (annotation > name-suffix > package), editable in one place.
+- `_classify_roles` now returns a per-(role, source) diagnostics counter, surfaced
+  on `IndexResult.roles`, so assignment quality (HIGH annotation vs LOW package
+  fallback) is observable.
 
-### Priority 4: Strengthen module boundary modeling
-- Support configurable module-root mapping (not only package/path heuristic).
-- Add `is_cross_module` or boundary strategy metadata for derived USES.
+### Priority 4: Strengthen module boundary modeling ✅ DONE
+- `_derive_module_ownership_and_uses` takes `module_roots` (explicit module-root
+  prefixes, longest-match-wins) and `module_root_depth` (how many leading
+  package/path segments form a module key; default 1 = old behaviour).
+- Component-level USES now carry a `component_aggregate:cross_module` /
+  `:intra_module` strategy tag so boundary-crossing deps (blast-radius signal) are
+  queryable without recomputation.
 
 ### Priority 5: Re-export support when TS/JS is introduced
 - Add RE_EXPORTS extraction/resolution once TypeScript/JavaScript indexing is in scope.

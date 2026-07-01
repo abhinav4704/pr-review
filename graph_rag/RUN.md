@@ -103,6 +103,10 @@ Pick with `GRAPH_RAG_LLM_PROVIDER` in `.env` (or `--provider`) and set the match
 MATCH (f:Function {repo:'sail'}) WHERE f.identity IS NOT NULL
 RETURN f.fqn, f.identity, f.semantic_confidence LIMIT 20;
 
+// keyword / concept retrieval (the retrieval-boost fields — no vectors needed)
+MATCH (n {repo:'sail'}) WHERE 'Authentication' IN n.identity_keywords RETURN n.fqn, n.identity;
+MATCH (n {repo:'sail'}) WHERE 'User' IN n.identity_concepts RETURN n.fqn LIMIT 20;
+
 // which functions still need a flow (Phase 2B is lazy)
 MATCH (f:Function {repo:'sail'}) WHERE f.semantic_state = 'IDENTITY_ONLY' RETURN count(f);
 
@@ -112,10 +116,45 @@ MATCH (f:Function {repo:'sail'}) WHERE 'external_api' IN f.flow_step_types RETUR
 MATCH (f:Function {repo:'sail'}) WHERE 'ab12cd34...' IN f.flow_references RETURN f.fqn;
 ```
 
-Each enriched node carries: `identity`, `semantic_confidence`, `semantic_model`,
-`semantic_provider`, `semantic_version`, `semantic_state` (`IDENTITY_ONLY` | `FULL`),
+Each enriched node carries: `identity`, `identity_keywords`, `identity_tags`,
+`identity_concepts` (retrieval-boost lists for keyword/concept search),
+`semantic_confidence`, `semantic_model`, `semantic_provider`, `semantic_version`,
+`semantic_state` (`IDENTITY_ONLY` | `FULL`),
 `semantic_hash`; and once a flow exists: `implementation_flow_json` (the full typed steps),
 `implementation_flow` (flat descriptions), `flow_step_types`, `flow_references`.
+
+## Embeddings (Phase 3 — vector leg)
+
+Embeds each node's **identity doc** (identity + concepts + keywords + signature — the
+summary, not the code) into a vector on the node, indexed by Neo4j's native vector index.
+This is the vector leg of hybrid retrieval; the keyword (`identity_keywords/tags/concepts`)
+and structural (graph traversal) legs need no embeddings. Run `semantic` first.
+
+Defaults to a **local** sentence-transformers model — offline, no API key, no per-token cost.
+
+```bash
+cd graph_rag
+
+# embed every identity that needs it (incremental: skips unchanged, re-embeds on
+# identity change / model change). Caps with --limit for a smoke test.
+./.venv/bin/python -m graph_rag.cli embed --repo NAME
+./.venv/bin/python -m graph_rag.cli embed --repo NAME --limit 20   # smoke test
+./.venv/bin/python -m graph_rag.cli embed --repo NAME --refresh    # re-embed all
+```
+
+Config via `.env`: `GRAPH_RAG_EMBED_PROVIDER` (`local` default · `voyage` · `openai`),
+`GRAPH_RAG_EMBED_MODEL` (default `all-MiniLM-L6-v2`, 384-dim). For `voyage`/`openai` set the
+matching key (`VOYAGE_API_KEY` / `OPENAI_API_KEY`) and `pip install voyageai` / `openai`.
+
+Each embedded node carries: `embedding`, `embedding_model`, `embedding_provider`,
+`embedding_dim`, `embedding_version`, `embedding_hash` (cache key = the identity's
+`semantic_hash`). The vector index is named `code_embedding` (cosine).
+
+```cypher
+// vector search — nearest identities to a query vector $q (k=10)
+CALL db.index.vector.queryNodes('code_embedding', 10, $q)
+YIELD node, score RETURN node.fqn, node.identity, score;
+```
 
 ## Other commands
 
@@ -125,6 +164,11 @@ NEO4J_PASSWORD=testpassword ./.venv/bin/python -m uvicorn webapp.server:app --po
 
 # resolver coverage probe (no DB)
 ./.venv/bin/python measure_coverage.py <path> --repo NAME
+
+# semantic/architecture edge regression (no DB) — runs the pipeline over fixtures/
+# and asserts EMITS_EVENT/CONSUMES_EVENT/REQUIRES_AUTH/ENFORCES_POLICY/PASSES/
+# DEFINES/BELONGS_TO/USES + Event/Policy/Module nodes still fire. Exit 1 on regression.
+./.venv/bin/python validate_fixtures.py
 
 # is SCIP installed & working on this machine?
 ./.venv/bin/python scip_check.py

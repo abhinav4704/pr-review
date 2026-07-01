@@ -41,6 +41,18 @@ class GraphStore:
             f"FOR (n:{SHARED_LABEL}) REQUIRE n.id IS UNIQUE"
         )
 
+    def create_vector_index(self, dim: int, name: str = "code_embedding"):
+        """Native Neo4j vector index over :CodeNode(embedding), cosine similarity.
+        `dim` is interpolated (not parametrizable in index OPTIONS) but is an int
+        we control — the model's dimension — so there is no injection surface."""
+        d = int(dim)
+        self._run(
+            f"CREATE VECTOR INDEX {name} IF NOT EXISTS "
+            f"FOR (n:{SHARED_LABEL}) ON (n.embedding) "
+            f"OPTIONS {{indexConfig: {{"
+            f"`vector.dimensions`: {d}, `vector.similarity_function`: 'cosine'}}}}"
+        )
+
     def wipe(self, repo: str):
         self._run(f"MATCH (n:{SHARED_LABEL} {{repo:$repo}}) DETACH DELETE n", repo=repo)
 
