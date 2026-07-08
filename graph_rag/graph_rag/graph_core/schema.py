@@ -2,7 +2,7 @@
 
 Used to validate any label/relationship-type that gets interpolated into a
 Cypher string (Cypher cannot parametrize labels/rel-types), preventing
-injection. Keep in sync with ../ARCHITECTURE.md section 5.
+injection. Keep in sync with ../docs/ARCHITECTURE.md section 5.
 """
 from __future__ import annotations
 

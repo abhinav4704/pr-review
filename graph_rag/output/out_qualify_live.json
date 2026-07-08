@@ -1,0 +1,19 @@
+[
+  {
+    "blast_count": 0,
+    "category": "security",
+    "confidence": "HIGH",
+    "evidence": "The summaries indicate that the order_id is used directly in the SQL command without any intermediate validation or sanitization.",
+    "file": "repository.py",
+    "id": "2c071c18e20ea28f",
+    "line": 18,
+    "message": "The order_id is passed directly from the endpoint_handler to the repository without any validation or sanitization steps in between.",
+    "owning_fqn": "repository.OrderRepository.delete_order",
+    "qualified_blast_count": 0,
+    "recommendation": "Check if the order_id is validated or sanitized before being used in the SQL command.",
+    "severity": 0.0,
+    "severity_label": "",
+    "source": "llm_judged",
+    "subcategory": "sql_injection"
+  }
+]

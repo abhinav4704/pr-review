@@ -10,8 +10,14 @@ import os
 import shutil
 from dataclasses import dataclass
 
-# graph_rag/graph_rag/config.py -> repo root is two dirs up.
-_ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+# graph_rag/graph_rag/graph_core/config.py -> repo root (where .env lives) is
+# three dirs up: graph_core -> graph_rag (package) -> graph_rag (project root).
+# NOTE: this was two dirs up before the graph_core/ package split — if this
+# ever stops finding real env vars again, check this path first before
+# assuming provider/credential env vars are simply unset.
+_ENV_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env"
+)
 try:
     from dotenv import load_dotenv
 
@@ -46,6 +52,34 @@ def scip_python_bin() -> str | None:
         if os.path.exists(local):
             return local
     return shutil.which("scip-python")
+
+
+# scip-java ships as a JVM app, not an npm package like scip-python — either a
+# native launcher script from a GitHub release (sourcegraph/scip-java), or run
+# on-demand via `coursier launch com.sourcegraph:scip-java_2.13:<version> --`.
+# We don't vendor a copy (no npm-style local install path); the user installs
+# it themselves (or coursier) and points at it, or puts it on PATH.
+_SCIP_JAVA_BIN_NAMES = ("scip-java", "scip-java.bat", "scip-java.cmd")
+
+
+def scip_java_bin() -> str | None:
+    """Locate the scip-java indexer binary.
+
+    Order: $SCIP_JAVA_BIN -> the copy installed under graph_rag/scip_tooling
+    (if the user drops one there) -> anything on PATH. Returns None if not
+    found (caller falls back to the heuristic resolver)."""
+    env = os.environ.get("SCIP_JAVA_BIN")
+    if env:
+        for cand in (env, env + ".bat", env + ".cmd"):
+            if os.path.exists(cand):
+                return cand
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # graph_rag/
+    bindir = os.path.join(here, "scip_tooling", "bin")
+    for name in _SCIP_JAVA_BIN_NAMES:
+        local = os.path.join(bindir, name)
+        if os.path.exists(local):
+            return local
+    return shutil.which("scip-java")
 
 
 @dataclass(frozen=True)

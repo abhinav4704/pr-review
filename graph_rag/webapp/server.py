@@ -24,9 +24,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from neo4j import GraphDatabase
 
-from graph_rag.config import neo4j_config
-from graph_rag.pipeline import index_repo
-from graph_rag.store import GraphStore
+from graph_rag.graph_core.config import neo4j_config
+from graph_rag.graph_core.pipeline import index_repo
+from graph_rag.graph_core.store import GraphStore
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPOS_DIR = os.path.join(HERE, "repos")
@@ -232,9 +232,9 @@ def ask_question(repo: str = Form(...), question: str = Form(...),
     use_llm=false (default) runs retrieval only — no prune, no answer — so it
     works with just the local embedder. use_llm=true runs the full loop and
     needs LLM creds (ANTHROPIC_API_KEY / Bedrock AWS creds)."""
-    from graph_rag.embeddings import DEFAULT_EMBED_PROVIDER, Embedder, default_embed_model
-    from graph_rag.llm import SemanticLLM
-    from graph_rag.retrieval import ask as retrieval_ask
+    from graph_rag.rag.embeddings import DEFAULT_EMBED_PROVIDER, Embedder, default_embed_model
+    from graph_rag.graph_core.llm import SemanticLLM
+    from graph_rag.rag.retrieval import ask as retrieval_ask
 
     meta = _load_registry().get(repo) or {}
     root = meta.get("root") or ""

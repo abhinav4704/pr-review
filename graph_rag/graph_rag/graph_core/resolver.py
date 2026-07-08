@@ -70,13 +70,38 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
 
     imports_by_file: dict[str, set[str]] = defaultdict(set)
     import_fqns_by_file: dict[str, set[str]] = defaultdict(set)
+    # Java-only: package-prefixes brought in via a wildcard import
+    # (`import a.b.*;`) — kept separate from import_fqns_by_file since a
+    # wildcard's import_fqn is a PACKAGE prefix, not a class FQN, and mixing
+    # it into the qualified-class matcher below would risk matching an
+    # unrelated same-tail-segment class name.
+    wildcard_pkgs_by_file: dict[str, set[str]] = defaultdict(set)
     for ref in refs:
         if ref.type != "IMPORTS" or not ref.ref_file:
+            continue
+        if ref.kind_hint == "import_wildcard":
+            if ref.import_fqn:
+                wildcard_pkgs_by_file[ref.ref_file].add(ref.import_fqn)
             continue
         if ref.target_name:
             imports_by_file[ref.ref_file].add(_tail_name(ref.target_name))
         if ref.import_fqn:
             import_fqns_by_file[ref.ref_file].add(ref.import_fqn)
+
+    # Java-only: package of the File a class/node lives in (from the File
+    # node's `package` attribute, set by the Java extractor) — used for
+    # same-package auto-visibility (no import needed to see a sibling class
+    # in the same package, the most common intra-package call pattern).
+    package_by_file: dict[str, str] = {
+        n.file: (n.package or "") for n in nodes if n.label == "File" and n.file
+    }
+
+    def _class_package(n: Node) -> str:
+        fqn = n.fqn or ""
+        name = n.name or ""
+        if fqn == name or not fqn.endswith(f".{name}"):
+            return ""
+        return fqn[: -(len(name) + 1)]
 
     # Endpoint index for CALLS_API matching. Exact key first; templated routes
     # (segments collapsed to `*`) matched segment-wise so a concrete caller path
@@ -106,7 +131,10 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
 
     methods_of_class: dict[str, dict[str, list[Node]]] = defaultdict(lambda: defaultdict(list))
     fields_of_class: dict[str, dict[str, list[Node]]] = defaultdict(lambda: defaultdict(list))
+    fields_of_file: dict[str, dict[str, list[Node]]] = defaultdict(lambda: defaultdict(list))
     for n in nodes:
+        if n.label == "Field" and n.scope == "module" and n.file:
+            fields_of_file[n.file][n.name].append(n)
         p = parent_of.get(n.id)
         if not (p and nodes_by_id.get(p) and nodes_by_id[p].label == "Class"):
             continue
@@ -189,6 +217,70 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
 
         # (5) Arity-only fallback if no stronger narrowing worked.
         return _apply_arity(ref, pool, "name")
+
+    def narrow_type(ref: RawRef) -> tuple[list[Node], str]:
+        """Best candidate set for a type-shaped ref (EXTENDS/IMPLEMENTS/
+        INSTANTIATES/AUTOWIRED) with the SAME package/import-awareness
+        `narrow_call` already gives CALLS/PASSES — previously these fell
+        straight to the generic global by-name lookup with zero scope
+        narrowing at all, the single biggest precision gap for Java, where
+        multiple classes sharing a simple name across different packages
+        (e.g. several `Impl`/`Repository`/`Config` classes) is routine."""
+        name = _tail_name(ref.target_name)
+        pool = [c for c in classes_by_name.get(name, [])]
+        if not pool:
+            return [], "none"
+        if len(pool) == 1:
+            return pool, "unique"
+        src_node = nodes_by_id.get(ref.src)
+        src_file = src_node.file if src_node else ""
+
+        # (1) Same-file preference (nested/sibling classes in one file).
+        if src_file:
+            same_file = [c for c in pool if c.file == src_file]
+            if same_file:
+                return same_file, "same_file"
+
+        # (2) Qualified (single-class) imports — an explicit single-type
+        # import SHADOWS a same-package class of the same simple name (Java
+        # scoping rule), so this must be checked before same-package below.
+        # Exact FQN match beats a bare tail/namespace match, since two
+        # candidates can share the same tail.
+        if src_file:
+            imported_fqns = import_fqns_by_file.get(src_file, set())
+            exact = [c for c in pool if c.fqn in imported_fqns]
+            if exact:
+                return exact, "imports_qualified_exact"
+            qualified_hits = _import_qualified_hits(pool, imported_fqns)
+            if qualified_hits:
+                return qualified_hits, "imports_qualified"
+
+        # (3) Same-package auto-visibility (Java: no import needed).
+        src_pkg = package_by_file.get(src_file, "") if src_file else ""
+        if src_pkg:
+            same_pkg = [c for c in pool if _class_package(c) == src_pkg]
+            if same_pkg:
+                return same_pkg, "same_package"
+
+        # (4) Wildcard imports (Java: `import a.b.*;`) — candidate's package
+        # matches one of the wildcard-imported package prefixes.
+        if src_file:
+            wpkgs = wildcard_pkgs_by_file.get(src_file, set())
+            if wpkgs:
+                wcard_hits = [c for c in pool if _class_package(c) in wpkgs]
+                if wcard_hits:
+                    return wcard_hits, "imports_wildcard"
+
+        # (5) Plain imported simple-name fallback (works for Python too, and
+        # is the ORIGINAL (pre-fix) behavior for Java as a last resort).
+        if src_file:
+            imported = imports_by_file.get(src_file, set())
+            imported_hits = [c for c in pool if c.name in imported]
+            if imported_hits:
+                return imported_hits, "imports"
+
+        # (6) Give up narrowing — global name match, still ambiguous if >1.
+        return pool, "name"
 
     extra_nodes: list[Node] = []
     annotation_ids: dict[str, str] = {}
@@ -394,13 +486,33 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
             # self.<field> resolved to the enclosing class's field — scope-exact.
             cid = enclosing_class_id(ref.src)
             wanted = fields_of_class[cid].get(ref.target_name, []) if cid else []
+            strategy = "same_scope"
+            if not wanted:
+                # Not inside a class (or not a class field) — fall back to a
+                # module-level global owned by the same file.
+                src_node = nodes_by_id.get(ref.src)
+                if src_node is not None and src_node.file:
+                    wanted = fields_of_file.get(src_node.file, {}).get(ref.target_name, [])
+                    strategy = "same_file_global"
             emit(
                 ref,
                 cov,
                 wanted,
                 Confidence.EXTRACTED.value,
                 known_in_repo=bool(wanted),
-                strategy="same_scope",
+                strategy=strategy,
+            )
+            continue
+
+        if ref.type in ("EXTENDS", "IMPLEMENTS", "INSTANTIATES", "AUTOWIRED"):
+            wanted, strategy = narrow_type(ref)
+            emit(
+                ref,
+                cov,
+                wanted,
+                Confidence.EXTRACTED.value if strategy not in ("name", "none") else Confidence.INFERRED.value,
+                known_in_repo=bool(classes_by_name.get(_tail_name(ref.target_name))),
+                strategy=strategy,
             )
             continue
 

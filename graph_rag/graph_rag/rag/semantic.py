@@ -33,8 +33,8 @@ import json
 import os
 from dataclasses import dataclass, field
 
-from .llm import SemanticLLM
-from .store import GraphStore
+from ..graph_core.llm import SemanticLLM
+from ..graph_core.store import GraphStore
 
 LEVELS = ("function", "class", "package", "repository")
 
@@ -346,7 +346,9 @@ def enrich_identities(repo: str, root: str, store: GraphStore, llm: SemanticLLM,
         rows = store.read(query, repo=repo)
         lr = LevelResult(level=level, total=len(rows))
         out_rows: list[dict] = []
-        for row in rows:
+        log(f"[{level}] {len(rows)} node(s) to check")
+        for i, row in enumerate(rows, start=1):
+            name = row.get("fqn") or row.get("name") or row.get("id")
             body_hash = row.get("body_hash") or ""
             fresh = (
                 row.get("semantic_hash") == body_hash
@@ -354,24 +356,28 @@ def enrich_identities(repo: str, root: str, store: GraphStore, llm: SemanticLLM,
             )
             if cacheable and not refresh and body_hash and fresh:
                 lr.cached += 1
+                log(f"  [{i}/{lr.total}] {level} {name} -- cached, skipped")
                 continue
             if limit is not None and lr.generated >= limit:
+                log(f"  [{i}/{lr.total}] {level} {name} -- limit reached, stopping level")
                 break
             prompt = build_prompt(row, root, source_mode)
             if dry_run:
                 lr.generated += 1
                 if lr.generated == 1:
-                    log(f"\n--- {level} identity dry-run ({row.get('fqn') or row.get('name')}) ---")
+                    log(f"\n--- {level} identity dry-run ({name}) ---")
                     log(prompt)
                 continue
+            log(f"  [{i}/{lr.total}] {level} {name} -- generating...")
             try:
                 data = llm.extract(SYSTEM_PROMPT, prompt, _IDENTITY_SCHEMA)
             except Exception as e:  # one bad node shouldn't abort the run
                 lr.failed += 1
-                log(f"  ! {level} {row.get('fqn') or row.get('name')}: {e}")
+                log(f"  [{i}/{lr.total}] {level} {name} -- FAILED: {e}")
                 continue
             out_rows.append({"id": row["id"], "props": _identity_props(data, body_hash, llm)})
             lr.generated += 1
+            log(f"  [{i}/{lr.total}] {level} {name} -- done")
         if out_rows and not dry_run:
             store.write_semantics(out_rows)
         log(f"  {level:<11} total={lr.total:<5} generated={lr.generated:<5} "
@@ -506,22 +512,26 @@ def generate_flows(repo: str, root: str, store: GraphStore, llm: SemanticLLM,
         rows = [r for r in rows if r["id"] in wanted]
     lr = LevelResult(level="flow", total=len(rows))
     out_rows: list[dict] = []
-    for row in rows:
+    log(f"[flow] {len(rows)} function(s) to check")
+    for i, row in enumerate(rows, start=1):
+        name = row.get("fqn") or row.get("name") or row.get("id")
         if limit is not None and lr.generated >= limit:
+            log(f"  [{i}/{lr.total}] flow {name} -- limit reached, stopping")
             break
         candidates = _candidate_map(row)
         prompt = _flow_prompt(row, root, candidates)
         if dry_run:
             lr.generated += 1
             if lr.generated == 1:
-                log(f"\n--- flow dry-run ({row.get('fqn') or row.get('name')}) ---")
+                log(f"\n--- flow dry-run ({name}) ---")
                 log(prompt)
             continue
+        log(f"  [{i}/{lr.total}] flow {name} -- generating...")
         try:
             data = llm.extract(_FLOW_SYSTEM_PROMPT, prompt, _FLOW_SCHEMA)
         except Exception as e:
             lr.failed += 1
-            log(f"  ! flow {row.get('fqn') or row.get('name')}: {e}")
+            log(f"  [{i}/{lr.total}] flow {name} -- FAILED: {e}")
             continue
         steps, step_types, ref_ids = _resolve_steps(data, candidates)
         out_rows.append({"id": row["id"], "props": {

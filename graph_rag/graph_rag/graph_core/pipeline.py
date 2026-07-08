@@ -11,7 +11,7 @@ from .discovery import discover
 from .ids import make_id
 from .models import Confidence, Edge, Node, Origin, RawRef
 from .resolver import Coverage, resolve
-from .scip_resolver import ScipReport, scip_resolve
+from .scip_resolver import ScipReport, scip_resolve, scip_resolve_java
 from .store import GraphStore
 from .validator import validate_graph
 
@@ -27,6 +27,7 @@ class IndexResult:
     validation: dict = field(default_factory=dict)
     db_counts: dict = field(default_factory=dict)
     scip: ScipReport = field(default_factory=ScipReport)
+    scip_java: ScipReport = field(default_factory=ScipReport)
     roles: dict = field(default_factory=dict)  # (role, source) -> count diagnostics
 
 
@@ -71,11 +72,32 @@ def index_repo(root: str, repo: str, store: GraphStore, wipe: bool = True,
             all_edges.extend(scip_edges)
             coverage.pop("CALLS", None)  # superseded by SCIP for Python
 
+    # Same idea for Java via scip-java, gated on an actual Maven/Gradle build
+    # being present (scip-java compiles the project with a semanticdb-javac
+    # plugin to get type info, so it can't run without one). Falls back to the
+    # (package/import-aware) heuristic resolver on any failure — missing
+    # binary, no JDK, no network to fetch deps, compile errors, etc.
+    scip_java_report = ScipReport()
+    has_java = any(f.lang == "java" for f in files)
+    scip_owns_java = False
+    if scip and has_java:
+        scip_java_edges, scip_java_report = scip_resolve_java(all_nodes, root, repo)
+        if scip_java_report.available:
+            scip_owns_java = True
+            all_edges = [
+                e for e in all_edges
+                if not (e.type == "CALLS" and lang_of.get(e.src) == "java")
+            ]
+            all_edges.extend(scip_java_edges)
+            coverage.pop("CALLS", None)  # superseded by SCIP for Java (and/or Python above)
+
     # Deterministic OVERRIDES from the class hierarchy (Java + Python). SCIP gives
-    # precise Python overrides when available, so drop heuristic Python ones then.
+    # precise overrides when available for a language, so drop heuristic ones then.
     override_edges = _derive_overrides(all_nodes, all_edges)
     if scip_owns_python:
         override_edges = [e for e in override_edges if lang_of.get(e.src) != "python"]
+    if scip_owns_java:
+        override_edges = [e for e in override_edges if lang_of.get(e.src) != "java"]
     all_edges.extend(override_edges)
 
     pkg_nodes, pkg_edges = _build_package_tree(all_nodes, repo)
@@ -107,6 +129,7 @@ def index_repo(root: str, repo: str, store: GraphStore, wipe: bool = True,
         validation=validation,
         db_counts=store.counts(repo),
         scip=scip_report,
+        scip_java=scip_java_report,
         roles={f"{role}:{source}": c for (role, source), c in role_diag.items()},
     )
 
@@ -314,14 +337,38 @@ def _classify_roles(nodes: list[Node], edges: list[Edge]) -> Counter:
             assign(n, "endpoint_handler", "edge_exposes", "HIGH")
             continue
         cur = parent_of.get(n.id)
+        matched = False
         while cur is not None:
             p = by_id.get(cur)
             if p is None:
                 break
             if p.label == "Class" and p.component_role:
-                assign(n, p.component_role, "owner_class", "MEDIUM")
+                # A method on a Controller class is effectively an endpoint
+                # even without an explicit route decorator we recognize
+                # (inherited routing, class-based views, framework patterns
+                # our extractor doesn't parse yet) — fall back to
+                # endpoint_handler at lower confidence instead of leaving it
+                # tagged merely "controller" (which never seeds taint
+                # analysis, since that only starts from endpoint_handler
+                # roots).
+                if p.component_role == "controller":
+                    assign(n, "endpoint_handler", "owner_class_controller", "MEDIUM")
+                else:
+                    assign(n, p.component_role, "owner_class", "MEDIUM")
+                matched = True
                 break
             cur = parent_of.get(cur)
+        if matched:
+            continue
+        # Module-level free function (no owning class, or owning class has no
+        # role either) — tag it "helper" at LOW confidence instead of leaving
+        # component_role blank. An unlabeled function otherwise reads to
+        # downstream consumers (Stage 1/2 architecture prompts) as an
+        # unexplained anomaly in an otherwise clean role sequence, which was
+        # observed to cause spurious layering_violation/missing_authorization
+        # findings on ordinary helpers like a `normalize_term`-style sanitizer
+        # that simply isn't a class method.
+        assign(n, "helper", "no_owning_class", "LOW")
 
     return diag
 

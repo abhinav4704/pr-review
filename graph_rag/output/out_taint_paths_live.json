@@ -1,0 +1,140 @@
+[
+  {
+    "path": [
+      "controllers.admin_delete_order_endpoint",
+      "repository.OrderRepository.delete_order"
+    ],
+    "path_hops": 1,
+    "sanitized": false,
+    "sink_callee": "conn.execute",
+    "sink_file": "repository.py",
+    "sink_fqn": "repository.OrderRepository.delete_order",
+    "sink_line": 18,
+    "source_file": "controllers.py",
+    "source_fqn": "controllers.admin_delete_order_endpoint",
+    "source_line": 37,
+    "source_param_index": 0,
+    "source_param_name": "order_id",
+    "status": "unsanitized_reach",
+    "vuln_class": "sql_injection"
+  },
+  {
+    "path": [
+      "controllers.get_order_endpoint",
+      "services.OrderService.get_order",
+      "repository.OrderRepository.fetch_order"
+    ],
+    "path_hops": 2,
+    "sanitized": false,
+    "sink_callee": "conn.execute",
+    "sink_file": "repository.py",
+    "sink_fqn": "repository.OrderRepository.fetch_order",
+    "sink_line": 10,
+    "source_file": "controllers.py",
+    "source_fqn": "controllers.get_order_endpoint",
+    "source_line": 24,
+    "source_param_index": 0,
+    "source_param_name": "order_id",
+    "status": "unsanitized_reach",
+    "vuln_class": "sql_injection"
+  },
+  {
+    "path": [
+      "controllers.place_order_endpoint",
+      "services.OrderService.place_order",
+      "repository.OrderRepository.save_order"
+    ],
+    "path_hops": 2,
+    "sanitized": false,
+    "sink_callee": "conn.execute",
+    "sink_file": "repository.py",
+    "sink_fqn": "repository.OrderRepository.save_order",
+    "sink_line": 23,
+    "source_file": "controllers.py",
+    "source_fqn": "controllers.place_order_endpoint",
+    "source_line": 44,
+    "source_param_index": 0,
+    "source_param_name": "order_id",
+    "status": "unsanitized_reach",
+    "vuln_class": "sql_injection"
+  },
+  {
+    "path": [
+      "controllers.place_order_endpoint",
+      "services.OrderService.place_order",
+      "repository.OrderRepository.save_order"
+    ],
+    "path_hops": 2,
+    "sanitized": false,
+    "sink_callee": "conn.execute",
+    "sink_file": "repository.py",
+    "sink_fqn": "repository.OrderRepository.save_order",
+    "sink_line": 23,
+    "source_file": "controllers.py",
+    "source_fqn": "controllers.place_order_endpoint",
+    "source_line": 44,
+    "source_param_index": 1,
+    "source_param_name": "item_id",
+    "status": "unsanitized_reach",
+    "vuln_class": "sql_injection"
+  },
+  {
+    "path": [
+      "controllers.place_order_endpoint",
+      "services.OrderService.place_order",
+      "repository.OrderRepository.save_order"
+    ],
+    "path_hops": 2,
+    "sanitized": false,
+    "sink_callee": "conn.execute",
+    "sink_file": "repository.py",
+    "sink_fqn": "repository.OrderRepository.save_order",
+    "sink_line": 23,
+    "source_file": "controllers.py",
+    "source_fqn": "controllers.place_order_endpoint",
+    "source_line": 44,
+    "source_param_index": 2,
+    "source_param_name": "qty",
+    "status": "unsanitized_reach",
+    "vuln_class": "sql_injection"
+  },
+  {
+    "path": [
+      "controllers.quick_delete_endpoint",
+      "repository.OrderRepository.delete_order"
+    ],
+    "path_hops": 1,
+    "sanitized": false,
+    "sink_callee": "conn.execute",
+    "sink_file": "repository.py",
+    "sink_fqn": "repository.OrderRepository.delete_order",
+    "sink_line": 18,
+    "source_file": "controllers.py",
+    "source_fqn": "controllers.quick_delete_endpoint",
+    "source_line": 30,
+    "source_param_index": 0,
+    "source_param_name": "order_id",
+    "status": "unsanitized_reach",
+    "vuln_class": "sql_injection"
+  },
+  {
+    "path": [
+      "controllers.search_orders_endpoint",
+      "services.OrderService.search_orders",
+      "repository.OrderRepository.search"
+    ],
+    "path_hops": 2,
+    "sanitized": false,
+    "sink_callee": "conn.execute",
+    "sink_file": "repository.py",
+    "sink_fqn": "repository.OrderRepository.search",
+    "sink_line": 14,
+    "source_file": "controllers.py",
+    "source_fqn": "controllers.search_orders_endpoint",
+    "source_line": 18,
+    "source_param_index": 0,
+    "source_param_name": "query",
+    "status": "unsanitized_reach",
+    "vuln_class": "sql_injection"
+  }
+]

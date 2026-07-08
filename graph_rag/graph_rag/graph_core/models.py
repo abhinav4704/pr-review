@@ -81,6 +81,9 @@ class Node:
     role_source: str = ""             # annotation|name_suffix|package|fallback
     role_confidence: str = ""         # HIGH|MEDIUM|LOW
     module_id: str = ""               # owning Module node id (derived)
+    # Field-node-only metadata
+    scope: str = ""                   # Field: class|module — where the variable lives
+    is_lock: bool = False             # Field: True if assigned a Lock/RLock/Semaphore/Condition
     # provenance
     extractor: str = ""              # who produced this node (tree-sitter)
     confidence: str = Confidence.EXTRACTED.value
@@ -126,6 +129,8 @@ class Node:
             "role_source": self.role_source,
             "role_confidence": self.role_confidence,
             "module_id": self.module_id,
+            "scope": self.scope,
+            "is_lock": self.is_lock,
             "extractor": self.extractor,
             "confidence": self.confidence,
         })

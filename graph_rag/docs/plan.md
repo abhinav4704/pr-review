@@ -114,6 +114,49 @@ downward, analyze the entire path for bad architecture, decide whether to split 
    (suppression/baseline), 11.4 (eval grading its own homework) before any new bug class; 11.3
    (name the taint precision level) decide now, don't discover later; 11.5 (clustering) can wait.**
 
+### A4. Architecture check — two-stage path-shape design (supersedes A2's single-edge table)
+User's refinement of A2: instead of (or in addition to) a hardcoded per-edge role-transition
+table, use the LLM itself to spot risky call-chain *shapes*, then go deep only on the ones it
+flags.
+
+**Why raw path enumeration still doesn't work, even with the LLM doing the filtering:** you still
+have to generate the paths before handing them to the LLM — a DAG with shared utility functions
+produces combinatorially many root→leaf paths regardless of who reads them next (same blowup A2
+already named).
+
+**The fix — collapse on `component_role` sequence ("shape"), not on function identity:**
+`controller -> service -> service -> repository -> entity` is one shape; hundreds of concrete
+call chains in a real repo collapse onto a handful of shapes, because architectural smell is a
+property of the role *pattern*, not of any one function. Shape-space is bounded
+(~`#roles^max_depth`), unlike path-space.
+
+**Stage 1 (bulk, cheap, one batched call):** walk `CALLS` from every
+`component_role == "endpoint_handler"` root (visited-set per path, fan-out cap per node, global
+step budget — same guard pattern as the god-node guard and Stage 3's blast-radius BFS), stopping
+each walk at a leaf (no further calls) or `max_depth`. Group by role-sequence shape; keep a count
+and up to 3 representative concrete instances (fqn chains) per shape. Feed the LLM the full shape
+catalogue (shape + count + representative examples) in ONE call; it returns which shape-ids look
+architecturally or security risky. This call implicitly does the job A2's separate "infer this
+repo's layering convention" step was for — no separate convention-inference call needed.
+
+**Stage 2 (targeted, one call per flagged shape):** for each flagged shape's representative
+instance, pull (or lazily generate via the existing `generate_flows(..., ids=[...])`)
+`implementation_flow` for every function in that specific chain, then ask a focused LLM call to
+produce real findings anchored to a specific function in the chain — catches whole-chain smells a
+single edge-check can't see (e.g. a technically-fine-per-edge chain that's too deep, revisits a
+role, or skips an expected layer like `endpoint_handler -> ... -> raw_sql` with no `service` in
+between).
+
+**No-LLM fallback (dry-run safe):** without an LLM, still deterministically report shapes marked
+`<cycle>` during the walk as `circular_architectural_dependency` findings, and shapes that hit
+`max_depth` without terminating as a `chain_too_deep` finding — both LOW/MEDIUM confidence,
+`graph_proven` source, no model call.
+
+**Where it fits:** new module `graph_rag/architecture.py`, its own CLI subcommand (`architecture`),
+feeding the existing `Finding`/Stage 3 blast-radius+severity pipeline unchanged — not a new
+stage/agent in the Stage-2-agent sense, since it runs its own internal two-call structure rather
+than the Agent 1/2 bundle shape.
+
 ---
 
 ## Original plan (verbatim, as drafted)

@@ -36,9 +36,9 @@ import re
 from dataclasses import dataclass, field
 
 from .embeddings import Embedder
-from .llm import SemanticLLM
+from ..graph_core.llm import SemanticLLM
 from .semantic import _read_source
-from .store import GraphStore
+from ..graph_core.store import GraphStore
 
 # reciprocal-rank-fusion constant; larger = flatter fusion (standard default 60)
 _RRF_K = 60

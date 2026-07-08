@@ -43,6 +43,12 @@ _REST_TEMPLATE_CALLS = {
 _AUTH_REQUIRE_ANNOTATIONS = {
     "Authenticated", "AuthenticationPrincipal", "LoginRequired",
 }
+# Spring/Jakarta DI annotations that mark a field/constructor param as an
+# injected dependency -> emitted as an AUTOWIRED type-shaped ref (schema.py
+# already reserves this edge type; nothing emitted it until now). Ported from
+# primitive-pr's Java resolution work (same annotation set, same single-
+# constructor inference rule) so graph_rag gets equivalent DI-edge coverage.
+_JAVA_AUTOWIRE_ANNOTATIONS = {"Autowired", "Inject", "Resource"}
 _POLICY_ANNOTATIONS = {
     "PreAuthorize", "Secured", "RolesAllowed", "PermissionsAllowed",
 }
@@ -142,9 +148,19 @@ def extract(file: FileInfo, repo: str):
                 if c.type in ("scoped_identifier", "identifier"):
                     package = text(src, c)
         elif child.type == "import_declaration":
-            name = _import_name(src, child)
+            name, fqn, is_wildcard = _import_name(src, child)
             if name:
-                ref("IMPORTS", file_id, name, "import", child)
+                if is_wildcard:
+                    # `import com.foo.util.*;` -- target_name marks the wildcard
+                    # explicitly (trailing ".*") so the resolver can expand it
+                    # to every in-repo class under that package, instead of
+                    # being mistaken for an import of a class literally named
+                    # after the package's last segment.
+                    ref("IMPORTS", file_id, f"{name}.*", "import_wildcard", child)
+                    refs[-1].import_fqn = name
+                else:
+                    ref("IMPORTS", file_id, name, "import", child)
+                    refs[-1].import_fqn = fqn
 
     nodes.append(Node(
         id=file_id, label="File", name=os.path.basename(file.relpath),
@@ -206,13 +222,35 @@ def extract(file: FileInfo, repo: str):
         route_prefix = _request_mapping_prefix(src, node)
         body = node.child_by_field_name("body")
         if body:
-            for child in body.children:
+            members = body.children
+            constructors = [c for c in members if c.type == "constructor_declaration"]
+            for child in members:
                 if child.type in ("method_declaration", "constructor_declaration"):
                     walk_method(child, fqn, cid, route_prefix)
+                    if child.type == "constructor_declaration":
+                        _extract_ctor_di(child, cid, single=len(constructors) == 1)
                 elif child.type == "field_declaration":
                     walk_field(child, fqn, cid)
                 elif child.type in _TYPE_DECLS:
                     walk_type(child, fqn, cid)
+
+    def _extract_ctor_di(ctor_node, class_id, single: bool):
+        """DI edge for constructor-injected dependencies: emitted when the
+        constructor is itself @Autowired/@Inject, OR it's the class's only
+        constructor (Spring's implicit-injection convention since 4.3 — no
+        annotation needed on a single constructor)."""
+        _, _, ctor_anns = modifiers_of(ctor_node)
+        if not single and not set(ctor_anns) & _JAVA_AUTOWIRE_ANNOTATIONS:
+            return
+        params_node = ctor_node.child_by_field_name("parameters")
+        if params_node is None:
+            return
+        for p in params_node.children:
+            if p.type not in ("formal_parameter", "spread_parameter"):
+                continue
+            t = p.child_by_field_name("type")
+            if t is not None:
+                ref("AUTOWIRED", class_id, simple_type_name(text(src, t)), "type", p)
 
     def walk_method(node, class_fqn, class_id, route_prefix=""):
         name_node = node.child_by_field_name("name")
@@ -329,9 +367,11 @@ def extract(file: FileInfo, repo: str):
                             mid, fname, "field", d, recv="this")
 
     def walk_field(node, class_fqn, class_id):
-        vis, mods, _ = modifiers_of(node)
+        vis, mods, anns = modifiers_of(node)
         type_node = node.child_by_field_name("type")
         ftype = simple_type_name(text(src, type_node)) if type_node is not None else ""
+        if ftype and set(anns) & _JAVA_AUTOWIRE_ANNOTATIONS:
+            ref("AUTOWIRED", class_id, ftype, "type", node)
         for d in node.children:
             if d.type == "variable_declarator":
                 nm = d.child_by_field_name("name")
@@ -444,11 +484,27 @@ def _params(src: bytes, params_node):
     return names, types
 
 
-def _import_name(src: bytes, node) -> str:
+def _import_name(src: bytes, node) -> tuple[str, str, bool]:
+    # Returns (target_name, fully_qualified_path, is_wildcard).
+    # `import a.b.C;`  -> ("C", "a.b.C", False) -- target_name is the simple
+    #     class name (what call/type sites reference), fqn is the full path
+    #     (what the resolver uses to disambiguate same-named classes in
+    #     different packages).
+    # `import a.b.*;`  -> ("a.b", "a.b", True) -- the wildcard's package prefix.
+    # `import static a.B.x;` -> treated like a normal import of `a.B` (the
+    #     static member itself isn't a class we model).
+    is_wildcard = any(c.type == "asterisk" for c in node.children)
+    scoped = None
     for c in node.children:
         if c.type in ("scoped_identifier", "identifier"):
-            return text(src, c)
-    return ""
+            scoped = c
+    if scoped is None:
+        return "", "", False
+    full = text(src, scoped)
+    if is_wildcard:
+        return full, full, True
+    tail = full.rsplit(".", 1)[-1]
+    return tail, full, False
 
 
 def _call_arity(call_node) -> int:

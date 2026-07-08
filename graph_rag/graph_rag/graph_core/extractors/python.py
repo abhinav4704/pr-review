@@ -45,6 +45,44 @@ def _visibility(name: str) -> str:
     return "public"
 
 
+_LOCK_CALL_NAMES = {"Lock", "RLock", "Semaphore", "BoundedSemaphore", "Condition"}
+
+
+def _is_lock_call(src: bytes, rhs_node) -> bool:
+    """True if `rhs_node` is a call to Lock()/RLock()/Semaphore()/... (threading
+    or multiprocessing) — flags a Field as guarding shared state."""
+    if rhs_node is None or rhs_node.type != "call":
+        return False
+    fn = rhs_node.child_by_field_name("function")
+    if fn is None:
+        return False
+    return _dotted_tail(src, fn) in _LOCK_CALL_NAMES
+
+
+def _base_ident_node(node):
+    """For `name[...]` / `name.attr` (possibly chained), the leftmost identifier
+    node; else None."""
+    n = node
+    while n is not None and n.type in ("subscript", "attribute"):
+        n = n.child_by_field_name("value" if n.type == "subscript" else "object")
+    return n if n is not None and n.type == "identifier" else None
+
+
+def _is_attr_or_kwarg_name(node) -> bool:
+    """True if `node` is the attribute-name side of `obj.name` or a keyword-arg
+    name in a call — not a real value reference to a same-named variable."""
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.type == "attribute" and parent.child_by_field_name("attribute") == node:
+        return True
+    if parent.type == "keyword_argument" and parent.child_by_field_name("name") == node:
+        return True
+    if parent.type in ("global_statement", "nonlocal_statement"):
+        return True
+    return False
+
+
 def extract(file: FileInfo, repo: str):
     src = file.source
     tree = get_parser("python").parse(src)
@@ -280,6 +318,7 @@ def extract(file: FileInfo, repo: str):
             _emit_exceptions(body, mid)
             if in_class:
                 _emit_state(body, mid, parent_fqn, container_id)
+            _emit_global_state(body, mid, module_globals)
             walk_block(body, fqn, mid, in_class=False)
         return mid
 
@@ -311,12 +350,14 @@ def extract(file: FileInfo, repo: str):
                         continue
                     created_fields.add(fid)
                     type_node = c.child_by_field_name("type")
+                    rhs = c.child_by_field_name("right")
                     nodes.append(Node(
                         id=fid, label="Field", name=fname, fqn=ffqn, repo=repo,
                         kind="field", lang="python", file=file.relpath,
                         start_line=stmt.start_point[0] + 1, start_col=stmt.start_point[1],
                         end_line=stmt.end_point[0] + 1, end_col=stmt.end_point[1],
-                        visibility=_visibility(fname),
+                        visibility=_visibility(fname), scope="class",
+                        is_lock=_is_lock_call(src, rhs),
                         return_type=text(src, type_node) if type_node else "",
                         extractor=EXTRACTOR,
                     ))
@@ -353,10 +394,75 @@ def extract(file: FileInfo, repo: str):
                 lang="python", file=file.relpath,
                 start_line=node.start_point[0] + 1, start_col=node.start_point[1],
                 end_line=node.end_point[0] + 1, end_col=node.end_point[1],
-                visibility=_visibility(name), extractor=EXTRACTOR))
+                visibility=_visibility(name), scope="class", extractor=EXTRACTOR))
             contains(class_id, node, fid)
             defines(class_id, node, fid)
         return fid
+
+    def _emit_global_state(body, fn_id, module_globals: dict):
+        """READS/WRITES of module-level globals within a function/method body.
+
+        Real Python scoping: a bare `name = ...` with no `global name` statement
+        makes `name` local for the *whole* function — so it shadows the module
+        global entirely (no READS/WRITES emitted for it in this function).
+        """
+        if not module_globals:
+            return
+        global_declared: set[str] = set()
+        for n in _scope_walk(body):
+            if n.type == "global_statement":
+                for c in n.children:
+                    if c.type == "identifier":
+                        nm = text(src, c)
+                        if nm in module_globals:
+                            global_declared.add(nm)
+        shadowed: set[str] = set()
+        for n in _scope_walk(body):
+            if n.type == "assignment":
+                left = n.child_by_field_name("left")
+                if left is not None and left.type == "identifier":
+                    nm = text(src, left)
+                    if nm in module_globals and nm not in global_declared:
+                        shadowed.add(nm)
+        write_ids = set()
+        for n in _scope_walk(body):
+            if n.type in ("assignment", "augmented_assignment"):
+                left = n.child_by_field_name("left")
+                if left is None:
+                    continue
+                targets = (
+                    left.children
+                    if left.type in ("pattern_list", "tuple", "tuple_pattern", "list_pattern")
+                    else [left]
+                )
+                for t in targets:
+                    if t.type == "identifier":
+                        nm = text(src, t)
+                        if nm not in module_globals or nm not in global_declared:
+                            continue
+                        write_ids.add(t.id)
+                        ref("WRITES", fn_id, nm, "field", t)
+                        if n.type == "augmented_assignment":
+                            ref("READS", fn_id, nm, "field", t)
+                    elif t.type in ("subscript", "attribute"):
+                        base = _base_ident_node(t)
+                        if base is None:
+                            continue
+                        nm = text(src, base)
+                        if nm in module_globals and nm not in shadowed:
+                            write_ids.add(t.id)
+                            write_ids.add(base.id)
+                            ref("WRITES", fn_id, nm, "field", t)
+                            ref("READS", fn_id, nm, "field", t)
+        for n in _scope_walk(body):
+            if (
+                n.type == "identifier"
+                and n.id not in write_ids
+                and not _is_attr_or_kwarg_name(n)
+            ):
+                nm = text(src, n)
+                if nm in module_globals and nm not in shadowed:
+                    ref("READS", fn_id, nm, "field", n)
 
     def _emit_state(body, fn_id, class_fqn, class_id):
         """READS/WRITES of `self.<field>` within a method (cross-object deferred)."""
@@ -403,6 +509,42 @@ def extract(file: FileInfo, repo: str):
                     mod,
                     import_fqn=text(src, mod).strip(),
                 )
+
+    # module-level globals: a pre-pass so `_emit_global_state` sees the full
+    # name set before any function body is processed (source-order independent).
+    module_globals: dict[str, str] = {}   # name -> field node id
+    for stmt in root.children:
+        if stmt.type != "expression_statement":
+            continue
+        for c in stmt.children:
+            if c.type != "assignment":
+                continue
+            left = c.child_by_field_name("left")
+            if left is None or left.type != "identifier":
+                continue
+            gname = text(src, left)
+            gfqn = f"{module_fqn}.{gname}" if module_fqn else gname
+            gid = make_id(repo, gfqn, "field")
+            if gid in created_fields:
+                continue
+            created_fields.add(gid)
+            rhs = c.child_by_field_name("right")
+            type_node = c.child_by_field_name("type")
+            nodes.append(Node(
+                id=gid, label="Field", name=gname, fqn=gfqn, repo=repo,
+                kind="global_variable", lang="python", file=file.relpath,
+                start_line=stmt.start_point[0] + 1, start_col=stmt.start_point[1],
+                end_line=stmt.end_point[0] + 1, end_col=stmt.end_point[1],
+                visibility=_visibility(gname), scope="module",
+                is_lock=_is_lock_call(src, rhs),
+                return_type=text(src, type_node) if type_node else "",
+                extractor=EXTRACTOR,
+            ))
+            contains(file_id, stmt, gid)
+            defines(file_id, stmt, gid)
+            if type_node is not None:
+                _emit_type(ref, "OF_TYPE", gid, src, type_node)
+            module_globals[gname] = gid
 
     walk_block(root, module_fqn, file_id, in_class=False)
     return nodes, edges, refs
