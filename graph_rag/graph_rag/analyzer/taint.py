@@ -71,6 +71,7 @@ from ..graph_core.extractors.common import iter_descendants, text
 from ..graph_core.findings import Finding
 from ..graph_core.languages import get_parser
 from ..graph_core.store import GraphStore
+from .context import file_imports_block, shared_state_for_ids
 from .scoring import score_findings
 
 # Well-known Python builtins that are terminal/side-effect-free wrt taint
@@ -91,10 +92,16 @@ _TAINT_INERT_BUILTINS = frozenset({
 
 # --- sink taxonomy (deterministic; matched against the call's dotted-tail name) ---
 SINK_PATTERNS: dict[str, tuple[str, ...]] = {
-    "sql_injection": ("execute", "executemany", "raw", "rawquery", "executescript"),
+    "sql_injection": (
+        "execute", "executemany", "raw", "rawquery", "executescript",
+        # Java JDBC (Statement/PreparedStatement) additions.
+        "executequery", "executeupdate", "executebatch", "executelargeupdate",
+    ),
     "command_injection": (
         "system", "popen", "call", "run", "spawn", "getoutput",
         "check_output", "check_call", "popen2", "popen3", "popen4",
+        # Java (Runtime.getRuntime().exec(...) / ProcessBuilder.start()).
+        "exec",
     ),
     "deserialization": ("loads", "load", "unpickle", "yaml_load", "read_pickle"),
     "path_traversal": (
@@ -419,16 +426,174 @@ def analyze_function(src: bytes, func_node, param_names: list[str]) -> FunctionT
     return result
 
 
+# --- Java transfer-function extraction ---------------------------------
+#
+# Mirrors `analyze_function` above but walks tree-sitter-java's grammar
+# instead of tree-sitter-python's: `method_invocation` (not `call`),
+# `variable_declarator`/`assignment_expression` (not a single `assignment`
+# node type), `argument_list` (not `arguments`). Deliberately the SAME
+# scope: local identifier-aliasing taint, same-function return propagation,
+# no cross-function solver, no field/container sensitivity — a v1 port, not
+# a rewrite of the approach.
+
+_JAVA_SCOPE_STOP_TYPES = (
+    "method_declaration", "constructor_declaration", "class_declaration",
+    "interface_declaration", "enum_declaration", "lambda_expression",
+)
+
+
+def _own_scope_java(node):
+    """Yield node's descendants, but do not descend into nested
+    method/class/lambda bodies — the Java analogue of `_own_scope`."""
+    stack = list(reversed(node.children))
+    while stack:
+        cur = stack.pop()
+        yield cur
+        if cur.type not in _JAVA_SCOPE_STOP_TYPES:
+            stack.extend(reversed(cur.children))
+
+
+def _java_identifiers(src: bytes, node) -> set[str]:
+    out: set[str] = set()
+    if node.type == "identifier":
+        out.add(text(src, node))
+    for d in iter_descendants(node):
+        if d.type == "identifier":
+            out.add(text(src, d))
+    return out
+
+
+def _java_callee_parts(src: bytes, invocation_node) -> tuple[str, str]:
+    """(receiver_tail, call_name) for a `method_invocation` node.
+    `conn.execute(...)` -> ("conn", "execute"); `eval(...)` -> ("", "eval")."""
+    obj = invocation_node.child_by_field_name("object")
+    name_node = invocation_node.child_by_field_name("name")
+    recv = text(src, obj) if obj is not None else ""
+    recv_tail = recv.rsplit(".", 1)[-1] if recv else ""
+    return recv_tail, text(src, name_node) if name_node is not None else ""
+
+
+def _java_call_lhs_assign_target(call_node, src: bytes) -> str:
+    """If `call_node` is the RHS of `Type x = call(...)` (variable_declarator)
+    or `x = call(...)` (assignment_expression), return 'x'; else ''."""
+    parent = call_node.parent
+    if parent is None:
+        return ""
+    if parent.type == "variable_declarator":
+        value = parent.child_by_field_name("value")
+        name_node = parent.child_by_field_name("name")
+        if value is not None and value.id == call_node.id and name_node is not None:
+            return text(src, name_node)
+        return ""
+    if parent.type == "assignment_expression":
+        right = parent.child_by_field_name("right")
+        left = parent.child_by_field_name("left")
+        if (right is not None and right.id == call_node.id
+                and left is not None and left.type == "identifier"):
+            return text(src, left)
+        return ""
+    return ""
+
+
+def analyze_function_java(src: bytes, func_node, param_names: list[str]) -> FunctionTaint:
+    """Java analogue of `analyze_function` — same coarse, over-approximating
+    identifier-aliasing taint tracking, walking tree-sitter-java nodes."""
+    result = FunctionTaint()
+    tainted: dict[str, set[int]] = {p: {i} for i, p in enumerate(param_names) if p}
+
+    body = func_node.child_by_field_name("body")
+    if body is None:
+        return result
+
+    for node in _own_scope_java(body):
+        if node.type == "variable_declarator":
+            name_node = node.child_by_field_name("name")
+            value_node = node.child_by_field_name("value")
+            if name_node is None or value_node is None:
+                continue
+            contributing: set[int] = set()
+            for rid in _java_identifiers(src, value_node):
+                contributing |= tainted.get(rid, set())
+            if contributing:
+                lname = text(src, name_node)
+                tainted[lname] = tainted.get(lname, set()) | contributing
+
+        elif node.type == "assignment_expression":
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left is None or right is None or left.type != "identifier":
+                continue
+            contributing = set()
+            for rid in _java_identifiers(src, right):
+                contributing |= tainted.get(rid, set())
+            if contributing:
+                lname = text(src, left)
+                tainted[lname] = tainted.get(lname, set()) | contributing
+
+        elif node.type == "method_invocation":
+            name_node = node.child_by_field_name("name")
+            args_node = node.child_by_field_name("arguments")
+            if name_node is None or args_node is None:
+                continue
+            recv, name = _java_callee_parts(src, node)
+            if not name:
+                continue
+            vuln_class = classify_sink(recv, name)
+            call_contributing: set[int] = set()
+            pos = 0
+            for c in args_node.children:
+                if c.type in ("(", ")", ","):
+                    continue
+                contributing = set()
+                for aid in _java_identifiers(src, c):
+                    contributing |= tainted.get(aid, set())
+                if contributing:
+                    call_contributing |= contributing
+                    if vuln_class:
+                        result.sinks.append({
+                            "vuln_class": vuln_class,
+                            "callee": f"{recv}.{name}" if recv else name,
+                            "line": node.start_point[0] + 1,
+                            "from_params": sorted(contributing),
+                        })
+                    else:
+                        result.passes.append({
+                            "callee": name,
+                            "arg_position": pos,
+                            "arg_keyword": None,
+                            "from_params": sorted(contributing),
+                        })
+                pos += 1
+
+            # Same-function conservative return-flow propagation (see
+            # `analyze_function`'s equivalent comment for rationale).
+            if call_contributing:
+                assigns_to = _java_call_lhs_assign_target(node, src)
+                if assigns_to:
+                    tainted[assigns_to] = tainted.get(assigns_to, set()) | call_contributing
+
+        elif node.type == "return_statement":
+            contributing = set()
+            for rid in _java_identifiers(src, node):
+                contributing |= tainted.get(rid, set())
+            for i in contributing:
+                if i not in result.returns_from_params:
+                    result.returns_from_params.append(i)
+
+    result.returns_from_params.sort()
+    return result
+
+
 def run_taint_pass(root: str, repo: str, store: GraphStore, refresh: bool = False,
                     limit: int | None = None) -> dict:
-    """Extract + write transfer facts for every Python Function node in
-    `repo`. Cached by body_hash — unchanged functions are skipped unless
+    """Extract + write transfer facts for every Python AND Java Function node
+    in `repo`. Cached by body_hash — unchanged functions are skipped unless
     `refresh`."""
     rows = store.read(
-        "MATCH (n:Function {repo:$repo, lang:'python'}) "
-        "WHERE $refresh OR n.taint_hash IS NULL OR n.taint_hash <> n.body_hash "
+        "MATCH (n:Function {repo:$repo}) WHERE n.lang IN ['python', 'java'] "
+        "AND ($refresh OR n.taint_hash IS NULL OR n.taint_hash <> n.body_hash) "
         "RETURN n.id AS id, n.file AS file, n.start_line AS start_line, "
-        "n.param_names AS param_names, n.body_hash AS body_hash",
+        "n.param_names AS param_names, n.body_hash AS body_hash, n.lang AS lang",
         repo=repo, refresh=refresh,
     )
     if limit is not None:
@@ -438,23 +603,30 @@ def run_taint_pass(root: str, repo: str, store: GraphStore, refresh: bool = Fals
     for row in rows:
         by_file.setdefault(row["file"], []).append(row)
 
-    files = [f for f in discover(root) if f.lang == "python" and f.relpath in by_file]
+    files = [f for f in discover(root) if f.lang in ("python", "java") and f.relpath in by_file]
+
+    _DEF_TYPES = {
+        "python": ("function_definition",),
+        "java": ("method_declaration", "constructor_declaration"),
+    }
 
     processed = 0
     sink_hits = 0
     out_rows: list[dict] = []
     for f in files:
-        tree = get_parser("python").parse(f.source)
+        tree = get_parser(f.lang).parse(f.source)
+        def_types = _DEF_TYPES[f.lang]
         by_line = {
             n.start_point[0] + 1: n
             for n in iter_descendants(tree.root_node)
-            if n.type == "function_definition"
+            if n.type in def_types
         }
+        analyzer = analyze_function if f.lang == "python" else analyze_function_java
         for row in by_file[f.relpath]:
             func_node = by_line.get(row["start_line"])
             if func_node is None:
                 continue
-            taint = analyze_function(f.source, func_node, row.get("param_names") or [])
+            taint = analyzer(f.source, func_node, row.get("param_names") or [])
             processed += 1
             sink_hits += len(taint.sinks)
             out_rows.append({
@@ -502,9 +674,10 @@ _SANITIZER_SYSTEM = (
 def find_sanitizer_candidates(store: GraphStore, repo: str, refresh: bool = False) -> list[dict]:
     """Candidates worth an LLM call: name hints at sanitization, or some other
     function's transfer facts actually name this one as a callee — i.e.
-    composition would really walk through it."""
+    composition would really walk through it. Language-agnostic (Python +
+    Java both populate `taint_json` via `run_taint_pass` now)."""
     rows = store.read(
-        "MATCH (n:Function {repo:$repo, lang:'python'}) "
+        "MATCH (n:Function {repo:$repo}) WHERE n.lang IN ['python', 'java'] "
         "RETURN n.id AS id, n.name AS name, n.fqn AS fqn, n.signature AS signature, "
         "n.docstring AS docstring, n.file AS file, n.start_line AS start_line, "
         "n.end_line AS end_line, n.body_hash AS body_hash, "
@@ -579,11 +752,15 @@ def tag_sanitizers(store: GraphStore, repo: str, root: str, llm, limit: int | No
     tagged = 0
     for row in candidates:
         source = _read_source(root, row.get("file"), row.get("start_line"), row.get("end_line"))
+        imports_block = file_imports_block(root, row.get("file") or "")
+        shared_state = shared_state_for_ids(store, [row["id"]]) if row.get("id") else ""
         user = (
             f"function: {row.get('fqn') or row.get('name')}\n"
             f"signature: {row.get('signature') or ''}\n"
             f"docstring: {row.get('docstring') or ''}\n"
-            f"source:\n{source}"
+            + (f"imports in {row.get('file')}:\n{imports_block}\n" if imports_block else "")
+            + (f"{shared_state} (real shared state, not a local variable)\n" if shared_state else "")
+            + f"source:\n{source}"
         )
         try:
             result = llm.extract(_SANITIZER_SYSTEM, user, _SANITIZER_SCHEMA)
@@ -1015,16 +1192,29 @@ _QUALIFY_SYSTEM = (
 )
 
 
-def _chain_source_blocks(root: str, fqns: list[str], by_fqn: dict) -> list[str]:
-    """Read the raw source of every function in `fqns`, in chain order."""
+def _chain_source_blocks(root: str, fqns: list[str], by_fqn: dict, store: GraphStore | None = None) -> list[str]:
+    """Read the raw source of every function in `fqns`, in chain order —
+    plus, no matter what, that function's file imports and any real
+    class/module-level shared state it reads/writes, since a sanitizer/guard
+    can live behind an imported helper or a shared flag the raw span alone
+    doesn't show."""
     root = os.path.abspath(root)
     lines = []
     for fqn in fqns:
         row = by_fqn.get(fqn, {})
         role = row.get("component_role") or "unknown"
         source = _read_source(root, row.get("file"), row.get("start_line"), row.get("end_line"))
+        extra = []
+        imports_block = file_imports_block(root, row.get("file") or "")
+        if imports_block:
+            extra.append(f"imports in {row.get('file')}:\n{imports_block}")
+        if store is not None and row.get("id"):
+            shared_state = shared_state_for_ids(store, [row["id"]])
+            if shared_state:
+                extra.append(f"{shared_state} (real shared state, not a local variable)")
+        extra_block = ("\n" + "\n".join(extra) + "\n") if extra else ""
         lines.append(
-            f"--- {fqn} (role={role}) ---\n{source or '(source unavailable)'}"
+            f"--- {fqn} (role={role}) ---\n{extra_block}{source or '(source unavailable)'}"
         )
     return lines
 
@@ -1037,7 +1227,7 @@ def qualify_taint_finding(store: GraphStore, repo: str, root: str, llm,
     if llm is None:
         return None
     fqns = finding.get("path") or [finding.get("owning_fqn")]
-    chain_lines = _chain_source_blocks(root, fqns, by_fqn)
+    chain_lines = _chain_source_blocks(root, fqns, by_fqn, store=store)
 
     user = (
         f"vuln_class: {finding.get('subcategory')}\n"
@@ -1368,7 +1558,7 @@ def _analyze_shape_instance(store: GraphStore, by_fqn: dict, root: str, shape_ke
     raw source of every function in it. Split out of `analyze_shape` so every
     example instance of a shape gets its own LLM call, not just the first."""
     chain_lines = []
-    for fqn, src_block in zip(fqns, _chain_source_blocks(root, fqns, by_fqn)):
+    for fqn, src_block in zip(fqns, _chain_source_blocks(root, fqns, by_fqn, store=store)):
         row = by_fqn.get(fqn, {})
         role = row.get("component_role") or "unknown"
         conf = row.get("role_confidence") or "?"

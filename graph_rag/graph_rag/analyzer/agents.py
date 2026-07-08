@@ -26,6 +26,7 @@ import os
 
 from ..graph_core.findings import Finding
 from ..graph_core.store import GraphStore
+from .context import file_imports_block, shared_state_for_ids
 
 _FANOUT_GUARD = 40
 
@@ -115,30 +116,6 @@ def _build_chunks(spans: list[dict], max_lines: int = 150) -> list[list[dict]]:
     if current:
         chunks.append(current)
     return chunks
-
-
-def _shared_state_for_ids(store: GraphStore, node_ids: list[str]) -> str:
-    if not node_ids:
-        return ""
-    rows = store.read(
-        "MATCH (n:Function) WHERE n.id IN $ids "
-        "OPTIONAL MATCH (n)-[:READS]->(rf:Field) "
-        "OPTIONAL MATCH (n)-[:WRITES]->(wf:Field) "
-        "RETURN collect(DISTINCT rf.name) AS reads_fields, collect(DISTINCT wf.name) AS writes_fields",
-        ids=node_ids,
-    )
-    if not rows:
-        return ""
-    reads = sorted({r for r in (rows[0].get("reads_fields") or []) if r})
-    writes = sorted({w for w in (rows[0].get("writes_fields") or []) if w})
-    if not reads and not writes:
-        return ""
-    parts = []
-    if reads:
-        parts.append(f"reads shared fields: {', '.join(reads)}")
-    if writes:
-        parts.append(f"writes shared fields: {', '.join(writes)}")
-    return "; ".join(parts)
 
 
 def _callers(store: GraphStore, node_id: str) -> list[dict]:
@@ -297,7 +274,11 @@ def run_agent_a_chunk(store: GraphStore, root: str, repo: str, file: str,
     if not src.strip():
         return []
     ids = [sp["id"] for sp in chunk]
-    shared_state = _shared_state_for_ids(store, ids)
+    shared_state = shared_state_for_ids(store, ids)
+    # Always resent for EVERY chunk of a file, not just the first — a later
+    # chunk's function can reference an imported name whose `import`/`from`
+    # line lives before this chunk's own read window.
+    imports_block = file_imports_block(root, file)
     fn_names = ", ".join(sp["name"] for sp in chunk if sp.get("name"))
 
     taint_flags = [
@@ -313,7 +294,8 @@ def run_agent_a_chunk(store: GraphStore, root: str, repo: str, file: str,
     user = (
         f"file: {file}\n"
         f"functions in this chunk (lines {start}-{end}): {fn_names}\n\n"
-        f"--- source ---\n{src}\n\n"
+        + (f"--- imports in {file} ---\n{imports_block}\n\n" if imports_block else "")
+        + f"--- source ---\n{src}\n\n"
         + (f"{shared_state} (this is real shared state — module/class-level, not a "
            "local variable)\n\n" if shared_state else "")
         + ("targeted checks:\n" + "\n".join(taint_flags) + "\n\n" if taint_flags else "")

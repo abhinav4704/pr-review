@@ -154,6 +154,49 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
             cur = parent_of.get(cur)
         return None
 
+    def _narrow_classes_for_recv(candidates: list[Node], src_file: str) -> list[Node]:
+        """Given >1 class sharing a simple name (e.g. two `PathUtil`s in
+        different packages), narrow to the one(s) actually visible from
+        `src_file` using the SAME precedence `narrow_type` uses for
+        EXTENDS/IMPLEMENTS/INSTANTIATES/AUTOWIRED: same-file > qualified
+        import (exact fqn > tail) > same-package > wildcard import > plain
+        imported simple name > give up (all).
+
+        Found live: `narrow_call`'s receiver-type/receiver-class-name steps
+        used to do `classes_by_name[name]` directly with NO package/import
+        filtering, so a call like `PathUtil.normalize(x)` with two same-name
+        `PathUtil` classes in different packages resolved to BOTH classes'
+        methods — producing duplicate/ambiguous CALLS edges (and duplicate
+        impact findings) even though only one was actually imported/visible.
+        """
+        if len(candidates) <= 1 or not src_file:
+            return candidates
+        same_file = [c for c in candidates if c.file == src_file]
+        if same_file:
+            return same_file
+        imported_fqns = import_fqns_by_file.get(src_file, set())
+        exact = [c for c in candidates if c.fqn in imported_fqns]
+        if exact:
+            return exact
+        qualified_hits = _import_qualified_hits(candidates, imported_fqns)
+        if qualified_hits:
+            return qualified_hits
+        src_pkg = package_by_file.get(src_file, "")
+        if src_pkg:
+            same_pkg = [c for c in candidates if _class_package(c) == src_pkg]
+            if same_pkg:
+                return same_pkg
+        wpkgs = wildcard_pkgs_by_file.get(src_file, set())
+        if wpkgs:
+            wcard_hits = [c for c in candidates if _class_package(c) in wpkgs]
+            if wcard_hits:
+                return wcard_hits
+        imported = imports_by_file.get(src_file, set())
+        imported_hits = [c for c in candidates if c.name in imported]
+        if imported_hits:
+            return imported_hits
+        return candidates
+
     def narrow_call(ref: RawRef) -> tuple[list[Node], str]:
         """Best candidate set for a CALLS ref with deterministic strategy ordering."""
         name = ref.target_name
@@ -180,6 +223,16 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
         if src_node is not None and src_node.file:
             imported = imports_by_file.get(src_node.file, set())
             imported_fqns = import_fqns_by_file.get(src_node.file, set())
+            # Exact owner-class match FIRST: `_import_qualified_hits` below is
+            # a loose tail/namespace match on `pool`'s (methods') own FQN,
+            # which can't disambiguate two same-name classes in different
+            # packages that both define a same-name method — both methods'
+            # FQNs end in "....PathUtil.normalize" regardless of package, so
+            # the loose match would hit both. Checking the method's OWNING
+            # CLASS fqn against the imported fqn exactly closes that gap.
+            exact_owner_hits = [c for c in pool if _class_package(c) in imported_fqns]
+            if exact_owner_hits:
+                return _apply_arity(ref, exact_owner_hits, "imports_qualified_exact")
             qualified_hits = _import_qualified_hits(pool, imported_fqns)
             if qualified_hits:
                 return _apply_arity(ref, qualified_hits, "imports_qualified")
@@ -193,8 +246,10 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
 
         # (4) Receiver-type narrowing.
         if ref.recv_type and ref.recv_type in classes_by_name:
+            src_file = src_node.file if src_node else ""
+            narrowed = _narrow_classes_for_recv(classes_by_name[ref.recv_type], src_file)
             hits: list[Node] = []
-            for ccls in classes_by_name[ref.recv_type]:
+            for ccls in narrowed:
                 hits.extend(methods_of_class[ccls.id].get(name, []))
             if hits:
                 return _apply_arity(ref, hits, "receiver_type_hint")
@@ -209,8 +264,10 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
 
         # Receiver is an in-repo class name -> that class's methods.
         if ref.recv and ref.recv not in ("self", "cls") and ref.recv in classes_by_name:
+            src_file = src_node.file if src_node else ""
+            narrowed = _narrow_classes_for_recv(classes_by_name[ref.recv], src_file)
             hits: list[Node] = []
-            for ccls in classes_by_name[ref.recv]:
+            for ccls in narrowed:
                 hits.extend(methods_of_class[ccls.id].get(name, []))
             if hits:
                 return _apply_arity(ref, hits, "receiver_type")
