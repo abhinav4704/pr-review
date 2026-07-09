@@ -1,12 +1,14 @@
 """Phase 0 orchestration: discover -> extract -> resolve -> write."""
 from __future__ import annotations
 
+import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from . import extractors
 from .canonical_ir import from_extractor, merge_bundles
+from .dataflow import DataflowResult, run_dataflow
 from .discovery import discover
 from .ids import make_id
 from .models import Confidence, Edge, Node, Origin, RawRef
@@ -29,6 +31,7 @@ class IndexResult:
     scip: ScipReport = field(default_factory=ScipReport)
     scip_java: ScipReport = field(default_factory=ScipReport)
     roles: dict = field(default_factory=dict)  # (role, source) -> count diagnostics
+    dfg: DataflowResult = field(default_factory=DataflowResult)
 
 
 def index_repo(root: str, repo: str, store: GraphStore, wipe: bool = True,
@@ -91,6 +94,21 @@ def index_repo(root: str, repo: str, store: GraphStore, wipe: bool = True,
             all_edges.extend(scip_java_edges)
             coverage.pop("CALLS", None)  # superseded by SCIP for Java (and/or Python above)
 
+    # DFG: compute function-summary data-flow graph and PASSES edges.
+    # Must run after SCIP so CALLS edges are as precise as possible (needed for
+    # binding ArgFlows to callee nodes). Replaces extractor-emitted PASSES edges
+    # so the parallel-array flow properties are always present.
+    dfg_result = run_dataflow(files, all_nodes, all_edges, repo)
+    all_edges = [e for e in all_edges if e.type != "PASSES"]
+    all_edges.extend(dfg_result.passes_edges)
+    nodes_by_id = {n.id: n for n in all_nodes}
+    for fn_id, props in dfg_result.node_props.items():
+        fn_node = nodes_by_id.get(fn_id)
+        if fn_node is not None:
+            fn_node.dfg_json = props.get("dfg_json", "")
+            fn_node.dfg_returns_from_params = props.get("dfg_returns_from_params", [])
+            fn_node.dfg_hash = props.get("dfg_hash", "")
+
     # Deterministic OVERRIDES from the class hierarchy (Java + Python). SCIP gives
     # precise overrides when available for a language, so drop heuristic ones then.
     override_edges = _derive_overrides(all_nodes, all_edges)
@@ -111,6 +129,14 @@ def index_repo(root: str, repo: str, store: GraphStore, wipe: bool = True,
     all_edges.extend(uses_edges)
 
     _attach_call_metrics(all_nodes, all_edges)
+
+    # SQL linkage: emit READS/WRITES edges from Function nodes to Table nodes
+    # by scanning function source for embedded SQL patterns.  Runs last so
+    # Table nodes (from .sql files) and Function nodes are both present.
+    files_by_rel = {f.relpath: f for f in files}
+    sql_link_edges = _derive_sql_links(all_nodes, files_by_rel)
+    all_edges.extend(sql_link_edges)
+
     validation = validate_graph(all_nodes, all_edges)
 
     store.bootstrap()
@@ -131,6 +157,7 @@ def index_repo(root: str, repo: str, store: GraphStore, wipe: bool = True,
         scip=scip_report,
         scip_java=scip_java_report,
         roles={f"{role}:{source}": c for (role, source), c in role_diag.items()},
+        dfg=dfg_result,
     )
 
 
@@ -275,13 +302,13 @@ _CLASS_ROLE_RULES: list[tuple[str, str, str, str, str]] = [
     ("suffix", "repository", "repository", "name_suffix", "MEDIUM"),
     ("suffix", "dao", "repository", "name_suffix", "MEDIUM"),
     ("suffix", "config", "config", "name_or_package", "MEDIUM"),
-    ("pkg", ".config", "config", "name_or_package", "MEDIUM"),
+    ("pkg", "config", "config", "name_or_package", "MEDIUM"),
     ("suffix", "util", "util", "name_suffix", "LOW"),
     ("suffix", "utils", "util", "name_suffix", "LOW"),
-    ("pkg", ".controller", "controller", "package", "LOW"),
-    ("pkg", ".service", "service", "package", "LOW"),
-    ("pkg", ".repo", "repository", "package", "LOW"),
-    ("pkg", ".repository", "repository", "package", "LOW"),
+    ("pkg", "controller", "controller", "package", "LOW"),
+    ("pkg", "service", "service", "package", "LOW"),
+    ("pkg", "repo", "repository", "package", "LOW"),
+    ("pkg", "repository", "repository", "package", "LOW"),
 ]
 
 
@@ -325,7 +352,7 @@ def _classify_roles(nodes: list[Node], edges: list[Edge]) -> Counter:
             if (
                 (kind == "ann" and key in anns)
                 or (kind == "suffix" and name.endswith(key))
-                or (kind == "pkg" and key in pkg)
+                or (kind == "pkg" and key in pkg.split("."))
             ):
                 assign(n, role, source, conf)
                 break
@@ -360,15 +387,8 @@ def _classify_roles(nodes: list[Node], edges: list[Edge]) -> Counter:
             cur = parent_of.get(cur)
         if matched:
             continue
-        # Module-level free function (no owning class, or owning class has no
-        # role either) — tag it "helper" at LOW confidence instead of leaving
-        # component_role blank. An unlabeled function otherwise reads to
-        # downstream consumers (Stage 1/2 architecture prompts) as an
-        # unexplained anomaly in an otherwise clean role sequence, which was
-        # observed to cause spurious layering_violation/missing_authorization
-        # findings on ordinary helpers like a `normalize_term`-style sanitizer
-        # that simply isn't a class method.
-        assign(n, "helper", "no_owning_class", "LOW")
+        # Leave component_role empty for module-level free functions with no
+        # classifiable owning class — downstream coalesces empty to "unknown".
 
     return diag
 
@@ -545,3 +565,95 @@ def _derive_module_ownership_and_uses(
         existing_edge_keys.add(("USES", sm, dm))
 
     return module_nodes, ownership_edges, uses_edges
+
+
+# SQL patterns that indicate a function reads from or writes to a table.
+# Applied against raw function source (already narrowed to line range).
+_SQL_WRITE_RES = [
+    re.compile(r"\bINSERT\s+(?:OR\s+\w+\s+)?INTO\s+[`\"']?(\w+)[`\"']?", re.I),
+    re.compile(r"\bUPDATE\s+[`\"']?(\w+)[`\"']?\s+SET\b", re.I),
+    re.compile(r"\bDELETE\s+FROM\s+[`\"']?(\w+)[`\"']?", re.I),
+    re.compile(r"\bMERGE\s+INTO\s+[`\"']?(\w+)[`\"']?", re.I),
+]
+_SQL_READ_RES = [
+    re.compile(r"\bFROM\s+[`\"']?(\w+)[`\"']?(?:\s+(?:AS\s+)?\w+)?(?:\s+WHERE|\s+JOIN|\s+GROUP|\s+ORDER|\s+LIMIT|[,\s]|$)", re.I),
+    re.compile(r"\bJOIN\s+[`\"']?(\w+)[`\"']?", re.I),
+]
+
+
+def _derive_sql_links(
+    all_nodes: list[Node],
+    files_by_rel: dict,
+) -> list[Edge]:
+    """Emit READS/WRITES edges from Function nodes to Table nodes by scanning
+    function source text for embedded SQL patterns.
+
+    Only emits edges when both a Function and a matching Table node exist in
+    all_nodes (same repo).  This runs at index time, so no DB query is needed.
+    """
+    # Build table lookup: lowercase table name -> table node id (per repo)
+    tables_by_repo: dict[str, dict[str, str]] = {}
+    for n in all_nodes:
+        if n.label == "Table":
+            tables_by_repo.setdefault(n.repo, {})[n.name.lower()] = n.id
+
+    if not tables_by_repo:
+        return []
+
+    edges: list[Edge] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for fn in all_nodes:
+        if fn.label != "Function" or not fn.file or not fn.start_line:
+            continue
+        known_tables = tables_by_repo.get(fn.repo)
+        if not known_tables:
+            continue
+        fi = files_by_rel.get(fn.file)
+        if fi is None:
+            continue
+
+        src_lines = fi.source.decode("utf-8", "replace").splitlines()
+        start = max(0, fn.start_line - 1)
+        end = fn.end_line if fn.end_line else len(src_lines)
+        fn_src = "\n".join(src_lines[start:end])
+
+        for pat in _SQL_WRITE_RES:
+            for m in pat.finditer(fn_src):
+                tname = m.group(1).lower()
+                tid = known_tables.get(tname)
+                if tid:
+                    k = (fn.id, "WRITES", tid)
+                    if k not in seen:
+                        seen.add(k)
+                        edges.append(Edge(
+                            type="WRITES",
+                            src=fn.id,
+                            dst=tid,
+                            confidence=Confidence.INFERRED.value,
+                            origin=Origin.DERIVED.value,
+                            extractor="sql_linker",
+                            evidence_file=fn.file,
+                            evidence_line=fn.start_line,
+                        ))
+
+        for pat in _SQL_READ_RES:
+            for m in pat.finditer(fn_src):
+                tname = m.group(1).lower()
+                tid = known_tables.get(tname)
+                if tid:
+                    k = (fn.id, "READS", tid)
+                    if k not in seen:
+                        seen.add(k)
+                        edges.append(Edge(
+                            type="READS",
+                            src=fn.id,
+                            dst=tid,
+                            confidence=Confidence.INFERRED.value,
+                            origin=Origin.DERIVED.value,
+                            extractor="sql_linker",
+                            evidence_file=fn.file,
+                            evidence_line=fn.start_line,
+                        ))
+
+    return edges

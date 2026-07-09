@@ -84,6 +84,10 @@ class Node:
     # Field-node-only metadata
     scope: str = ""                   # Field: class|module — where the variable lives
     is_lock: bool = False             # Field: True if assigned a Lock/RLock/Semaphore/Condition
+    # DFG summary (computed by dataflow.py at index time)
+    dfg_json: str = ""                                    # serialized DfgSummary
+    dfg_returns_from_params: list[int] = field(default_factory=list)
+    dfg_hash: str = ""                                    # body_hash at summary time
     # provenance
     extractor: str = ""              # who produced this node (tree-sitter)
     confidence: str = Confidence.EXTRACTED.value
@@ -131,6 +135,9 @@ class Node:
             "module_id": self.module_id,
             "scope": self.scope,
             "is_lock": self.is_lock,
+            "dfg_json": self.dfg_json,
+            "dfg_returns_from_params": self.dfg_returns_from_params,
+            "dfg_hash": self.dfg_hash,
             "extractor": self.extractor,
             "confidence": self.confidence,
         })
@@ -150,6 +157,11 @@ class Edge:
     evidence_col: int = 0            # 0-based
     strategy: str = ""              # resolver strategy used for destination selection
     arg_names: list[str] = field(default_factory=list)  # lightweight arg-flow payload (PASSES)
+    # DFG parallel arrays on PASSES edges (index-aligned per recorded ArgFlow)
+    flow_from_param: list[int] = field(default_factory=list)  # caller param index (-1 = no param origin)
+    flow_to_param: list[int] = field(default_factory=list)    # callee param index (-1 = unmappable)
+    flow_lines: list[int] = field(default_factory=list)       # call-site line per entry
+    const_args: list[int] = field(default_factory=list)       # callee param positions that receive only literals
 
     def props(self) -> dict:
         return _clean({
@@ -161,6 +173,10 @@ class Edge:
             "evidence_col": self.evidence_col,
             "strategy": self.strategy,
             "arg_names": self.arg_names,
+            "flow_from_param": self.flow_from_param,
+            "flow_to_param": self.flow_to_param,
+            "flow_lines": self.flow_lines,
+            "const_args": self.const_args,
         })
 
 
@@ -181,3 +197,4 @@ class RawRef:
     ref_col: int = 0    # 0-based
     call_arity: int = -1
     arg_names: list[str] = field(default_factory=list)  # optional arg names for PASSES
+    strategy_hint: str = ""  # "fuzzy_name" when the ref came from a substring/loose heuristic

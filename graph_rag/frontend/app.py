@@ -6,9 +6,9 @@ Run (from this directory's parent, i.e. graph_rag/):
 Pipeline, each step collapsible with its own output:
   1. Connect to GitHub, pick a repo + ref, download a source snapshot.
   2. Index into Neo4j (shared structural graph).
-  3. Agent B, pass 1: deterministic sink tagging + taint composition (no LLM).
+  3. Agent B, pass 1: deterministic taint composition from graph DFG facts (no LLM).
   4. Agent A: correctness + impact, chunked over the repo (LLM).
-  5. Agent B, pass 2: taint qualify — reads raw chain source directly (LLM).
+  5. Agent B, pass 2: security discovery — reads reachable chains + taint evidence, free-form (LLM).
   6. Agent B, pass 3: architecture/layering — shape catalogue + raw-code deep-dive (LLM).
   7. Combined, deduped, scored findings + JSON download.
 
@@ -33,10 +33,11 @@ from graph_rag.graph_core.config import neo4j_config  # noqa: E402
 from graph_rag.graph_core.store import GraphStore  # noqa: E402
 from graph_rag.graph_core.pipeline import index_repo  # noqa: E402
 from graph_rag.graph_core.llm import SemanticLLM, DEFAULT_PROVIDER, PROVIDERS, default_model  # noqa: E402
-from graph_rag.graph_core.findings import Finding, dedupe  # noqa: E402
+from graph_rag.graph_core.findings import Finding  # noqa: E402
 from graph_rag.analyzer import agents as agents_mod  # noqa: E402
 from graph_rag.analyzer import taint as taint_mod  # noqa: E402
 from graph_rag.analyzer import scoring as scoring_mod  # noqa: E402
+from graph_rag.analyzer.dedup import dedupe_findings  # noqa: E402
 
 st.set_page_config(page_title="Graph RAG — 2-agent code analysis", layout="wide")
 
@@ -93,7 +94,7 @@ with st.sidebar:
 st.title("Graph RAG — 2-agent code analysis")
 st.caption(
     "Agent A = correctness + impact (merged, one LLM call per chunk) · "
-    "Agent B = taint composition + qualify + architecture/layering (reads raw chain source directly)"
+    "Agent B = taint composition + free-form security discovery + architecture/layering (reads raw chain source directly)"
 )
 
 limit = int(ss.limit) or None
@@ -224,7 +225,7 @@ with st.container(border=True):
     st.subheader("🚀 Run full pipeline")
     st.caption(
         "Runs steps 2-7 end to end with current sidebar/LLM settings: index -> "
-        "Agent B pass 1 (taint tagging) -> Agent A -> Agent B pass 2 (qualify) -> "
+        "Agent B pass 1 (taint composition) -> Agent A -> Agent B pass 2 (security discovery) -> "
         "Agent B pass 3 (architecture) -> combined + scored. "
         "Equivalent to clicking every step's button in order."
     )
@@ -261,17 +262,16 @@ with st.container(border=True):
             })
             _log_rp(f"[index] files={res.files} nodes={res.nodes} edges={res.edges}")
 
-            # 3. Agent B pass 1: deterministic sink tagging + taint composition
-            progress.progress(2 / 6, text="Step 3 — Agent B pass 1 (taint tagging)...")
+            # 3. Agent B pass 1: deterministic taint composition (reads dfg_json from graph)
+            progress.progress(2 / 6, text="Step 3 — Agent B pass 1 (taint composition)...")
             store = GraphStore(neo4j_config())
             try:
-                tag_stats = taint_mod.run_taint_pass(repo_path, repo_name, store, limit=limit)
-                taint_findings = taint_mod.find_taint_findings(store, repo_name, max_hops=ss.get("max_hops", 6))
+                taint_findings = taint_mod.find_taint_findings(
+                    store, repo_name, root=repo_path, max_hops=ss.get("max_hops", 6))
             finally:
                 store.close()
-            _mark("taint", {"tag_stats": tag_stats, "findings": taint_findings})
-            _log_rp(f"[taint] functions_processed={tag_stats.get('functions_processed')} "
-                    f"sink_hits={tag_stats.get('sink_hits')} deterministic findings={len(taint_findings)}")
+            _mark("taint", {"findings": taint_findings})
+            _log_rp(f"[taint] deterministic findings={len(taint_findings)}")
 
             # 4. Agent A: correctness + impact
             progress.progress(3 / 6, text="Step 4 — Agent A (correctness + impact)...")
@@ -284,16 +284,16 @@ with st.container(border=True):
             _mark("agent_a", a_findings)
             _log_rp(f"[agent A] findings={len(a_findings)}")
 
-            # 5. Agent B pass 2: taint qualify
-            progress.progress(4 / 6, text="Step 5 — Agent B pass 2 (taint qualify)...")
+            # 5. Agent B pass 2: security discovery (free-form, taint as evidence)
+            progress.progress(4 / 6, text="Step 5 — Agent B pass 2 (security discovery)...")
             store = GraphStore(neo4j_config())
             try:
-                qualified = taint_mod.run_taint_qualify(
+                qualified = taint_mod.run_agent_b_security(
                     store, repo_name, repo_path, llm, max_hops=ss.get("max_hops", 6), limit=None)
             finally:
                 store.close()
             _mark("agent_b_qualify", qualified)
-            _log_rp(f"[agent B qualify] confirmed true_positive={len(qualified)}")
+            _log_rp(f"[agent B security] discovery findings={len(qualified)}")
 
             # 6. Agent B pass 3: architecture/layering
             progress.progress(5 / 6, text="Step 6 — Agent B pass 3 (architecture)...")
@@ -314,7 +314,9 @@ with st.container(border=True):
                        message=f["message"], confidence="HIGH")
                 for f in taint_findings
             ]
-            all_findings = dedupe(stage1 + a_findings + arch["findings"])
+            # Agent B security findings are DISCOVERY now — merge into the scored
+            # set and dedup (graph_proven beats an llm re-report of the same family).
+            all_findings = dedupe_findings(stage1 + a_findings + arch["findings"] + qualified)
 
             store = GraphStore(neo4j_config())
             try:
@@ -357,21 +359,20 @@ if not _done("index"):
     st.stop()
 
 # ------------------------------------------------------- step 3: taint ------
-with st.expander("Step 3 — Agent B pass 1: deterministic sink tagging + taint composition (no LLM)",
+with st.expander("Step 3 — Agent B pass 1: deterministic taint composition (no LLM)",
                  expanded=not _done("taint")):
     max_hops = st.slider("Max composition hops", 1, 10, 6, key="max_hops")
-    if st.button("Run taint tagging pass", type="primary"):
-        with st.spinner("Tagging sinks + composing source-to-sink chains..."):
+    if st.button("Run taint composition pass", type="primary"):
+        with st.spinner("Composing source-to-sink chains from graph DFG facts..."):
             store = GraphStore(neo4j_config())
             try:
-                tag_stats = taint_mod.run_taint_pass(repo_path, repo_name, store, limit=limit)
-                findings = taint_mod.find_taint_findings(store, repo_name, max_hops=max_hops)
+                findings = taint_mod.find_taint_findings(
+                    store, repo_name, root=repo_path, max_hops=max_hops)
             finally:
                 store.close()
-            _mark("taint", {"tag_stats": tag_stats, "findings": findings})
+            _mark("taint", {"findings": findings})
     if _done("taint"):
         res = ss.step_results["taint"]
-        st.write(f"tag stats: {res['tag_stats']}")
         st.write(f"**deterministic (graph_proven) findings: {len(res['findings'])}**")
         for f in res["findings"]:
             st.write(f"- `[{f['subcategory']}]` {f['owning_fqn']} ({f['file']}:{f['line']}) — {f['message']}")
@@ -398,26 +399,26 @@ with st.expander("Agent A — correctness + impact (one LLM call per whole-funct
         for f in fs:
             st.write(f"- `[{f.subcategory}]` {f.owning_fqn} ({f.file}:{f.line}) — {f.message}")
 
-# --------------------------------------------------- step 5: Agent B qualify -
-st.header("Step 5 — Agent B pass 2: taint qualify")
+# --------------------------------------------- step 5: Agent B security -----
+st.header("Step 5 — Agent B pass 2: security discovery")
 
-with st.expander("Agent B — taint qualify (reads raw chain source directly)",
+with st.expander("Agent B — security discovery (reads reachable chains + taint evidence, free-form)",
                  expanded=not _done("agent_b_qualify")):
-    qualify_limit = st.number_input("Cap findings qualified (cost control, 0 = no cap)",
+    qualify_limit = st.number_input("Cap chains reviewed (cost control, 0 = no cap)",
                                     min_value=0, value=0, step=1, key="qualify_limit")
-    if st.button("Run Agent B qualify", key="run_agent_b_qualify"):
-        with st.spinner("Agent B qualifying deterministic taint findings..."):
+    if st.button("Run Agent B security", key="run_agent_b_qualify"):
+        with st.spinner("Agent B reviewing reachable chains for vulnerabilities..."):
             store = GraphStore(neo4j_config())
             try:
-                findings = taint_mod.run_taint_qualify(store, repo_name, repo_path, _llm(),
-                                                       max_hops=ss.get("max_hops", 6),
-                                                       limit=int(qualify_limit) or None)
+                findings = taint_mod.run_agent_b_security(store, repo_name, repo_path, _llm(),
+                                                          max_hops=ss.get("max_hops", 6),
+                                                          limit=int(qualify_limit) or None)
             finally:
                 store.close()
             _mark("agent_b_qualify", findings)
     if _done("agent_b_qualify"):
         fs = ss.step_results["agent_b_qualify"]
-        st.write(f"**{len(fs)} confirmed true_positive finding(s)**")
+        st.write(f"**{len(fs)} security finding(s)**")
         for f in fs:
             st.write(f"- `[{f.subcategory}]` {f.owning_fqn} ({f.file}:{f.line}) — {f.message}")
 
@@ -468,7 +469,10 @@ with st.expander("Combined, deduped, scored findings", expanded=True):
             ]
             agent_a = ss.step_results.get("agent_a", [])
             arch = ss.step_results.get("agent_b_architecture", {}).get("findings", [])
-            all_findings = dedupe(stage1 + agent_a + arch)
+            security = ss.step_results.get("agent_b_qualify", [])
+            # Agent B security findings are DISCOVERY now — merge into scored and
+            # dedup (graph_proven beats an llm re-report of the same family).
+            all_findings = dedupe_findings(stage1 + agent_a + arch + security)
 
             store = GraphStore(neo4j_config())
             try:
@@ -477,20 +481,12 @@ with st.expander("Combined, deduped, scored findings", expanded=True):
             finally:
                 store.close()
 
-            # Agent B qualify list kept separate, additive — not merged into
-            # `scored`, since its finding_id would collide with the matching
-            # graph_proven entry under dedupe() (same
-            # owning_fqn+category+subcategory+line) and one would be silently
-            # dropped. Shown alongside instead.
-            ss.step_results["combined"] = {
-                "scored": scored,
-                "agent_b_qualified": ss.step_results.get("agent_b_qualify", []),
-            }
+            ss.step_results["combined"] = {"scored": scored}
 
     combined = ss.step_results.get("combined")
     if combined:
         scored = combined["scored"]
-        st.subheader(f"Scored findings (Agent A + Agent B architecture + deterministic taint) — {len(scored)}")
+        st.subheader(f"Scored findings (Agent A + Agent B security + architecture + deterministic taint) — {len(scored)}")
         for f in scored:
             st.write(
                 f"**{f.severity_label}** {f.severity:.2f}  `[{f.category}/{f.subcategory}]` "
@@ -498,15 +494,8 @@ with st.expander("Combined, deduped, scored findings", expanded=True):
             )
             st.caption(f.message)
 
-        agent_b_q = combined["agent_b_qualified"]
-        st.subheader(f"Agent B qualify — LLM-confirmed taint true positives (separate list) — {len(agent_b_q)}")
-        for f in agent_b_q:
-            st.write(f"`[{f.subcategory}]` {f.owning_fqn} ({f.file}:{f.line})")
-            st.caption(f.message)
-
         combined_json = json.dumps({
             "scored": [f.to_dict() for f in scored],
-            "agent_b_qualified": [f.to_dict() for f in agent_b_q],
         }, indent=2, sort_keys=True)
         st.download_button("Download combined JSON", combined_json,
                            file_name=f"{repo_name}_findings.json", mime="application/json")

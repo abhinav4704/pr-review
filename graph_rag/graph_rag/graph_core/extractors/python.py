@@ -123,6 +123,7 @@ def extract(file: FileInfo, repo: str):
         recv_type="",
         import_fqn="",
         arg_names=None,
+        strategy_hint="",
     ):
         refs.append(RawRef(
             rtype, src_id, target, kind_hint, recv=recv,
@@ -132,6 +133,7 @@ def extract(file: FileInfo, repo: str):
             ref_line=node.start_point[0] + 1, ref_col=node.start_point[1],
             call_arity=call_arity,
             arg_names=list(arg_names or []),
+            strategy_hint=strategy_hint,
         ))
 
     def emit_endpoint(method, route, handler_id, ev_node):
@@ -207,7 +209,7 @@ def extract(file: FileInfo, repo: str):
         for dname, dnode in decos:
             ref("ANNOTATED_WITH", cid, dname, "annotation", dnode)
             for et in _auth_specs(dname, src, dnode):
-                ref(et[0], cid, et[1], "policy", dnode)
+                ref(et[0], cid, et[1], "policy", dnode, strategy_hint="fuzzy_name" if et[2] else "")
         supers = node.child_by_field_name("superclasses")
         if supers:
             for c in supers.children:
@@ -259,10 +261,11 @@ def extract(file: FileInfo, repo: str):
         for dname, dnode in decos:
             ref("ANNOTATED_WITH", mid, dname, "annotation", dnode)
             for et in _auth_specs(dname, src, dnode):
-                ref(et[0], mid, et[1], "policy", dnode)
-            topic = _event_consumer_topic(dname, src, dnode)
-            if topic:
-                ref("CONSUMES_EVENT", mid, topic, "event", dnode)
+                ref(et[0], mid, et[1], "policy", dnode, strategy_hint="fuzzy_name" if et[2] else "")
+            topic_result = _event_consumer_topic(dname, src, dnode)
+            if topic_result[0]:
+                ref("CONSUMES_EVENT", mid, topic_result[0], "event", dnode,
+                    strategy_hint="fuzzy_name" if topic_result[1] else "")
             for method, route in _endpoint_specs(src, dnode):
                 emit_endpoint(method, route, mid, dnode)
         # type edges: return annotation + parameter annotations
@@ -294,27 +297,17 @@ def extract(file: FileInfo, repo: str):
                             call_arity=_call_arity(d),
                             recv_type=_infer_receiver_type(src, fn, receiver_types),
                         )
-                        if pass_args:
-                            ref(
-                                "PASSES",
-                                mid,
-                                callee,
-                                "call",
-                                fn,
-                                recv=_receiver(src, fn),
-                                call_arity=_call_arity(d),
-                                recv_type=_infer_receiver_type(src, fn, receiver_types),
-                                arg_names=pass_args,
-                            )
                     ob = _outbound_call(src, d)
                     if ob is not None:
                         emit_api_call(mid, ob[0], ob[1], fn)
-                    ev = _outbound_event(src, d)
-                    if ev:
-                        ref("EMITS_EVENT", mid, ev, "event", fn)
-                    evc = _inbound_event(src, d)
-                    if evc:
-                        ref("CONSUMES_EVENT", mid, evc, "event", fn)
+                    ev_result = _outbound_event(src, d)
+                    if ev_result[0]:
+                        ref("EMITS_EVENT", mid, ev_result[0], "event", fn,
+                            strategy_hint="fuzzy_name" if ev_result[1] else "")
+                    evc_result = _inbound_event(src, d)
+                    if evc_result[0]:
+                        ref("CONSUMES_EVENT", mid, evc_result[0], "event", fn,
+                            strategy_hint="fuzzy_name" if evc_result[1] else "")
             _emit_exceptions(body, mid)
             if in_class:
                 _emit_state(body, mid, parent_fqn, container_id)
@@ -833,6 +826,10 @@ def _endpoint_specs(src: bytes, deco_node) -> list[tuple[str, str]]:
     return []
 
 
+def _looks_like_url(s: str) -> bool:
+    return s.startswith(("/", "http://", "https://"))
+
+
 def _outbound_call(src: bytes, call_node):
     """If this call is an outbound HTTP request, return (METHOD, url-literal)."""
     fn = call_node.child_by_field_name("function")
@@ -840,7 +837,7 @@ def _outbound_call(src: bytes, call_node):
         return None
     if fn.type == "identifier" and text(src, fn) == "urlopen":
         url = _string_arg(src, call_node, 0)
-        return ("GET", url) if url else None
+        return ("GET", url) if url and _looks_like_url(url) else None
     if fn.type != "attribute":
         return None
     tail = _dotted_tail(src, fn)
@@ -849,42 +846,52 @@ def _outbound_call(src: bytes, call_node):
         return None
     if tail in HTTP_METHODS:
         url = _string_arg(src, call_node, 0)
-        return (tail.upper(), url) if url else None
+        return (tail.upper(), url) if url and _looks_like_url(url) else None
     if tail == "request":
         verb = _string_arg(src, call_node, 0)
         url = _string_arg(src, call_node, 1)
-        return (verb.upper(), url) if verb and url else None
+        return (verb.upper(), url) if verb and url and _looks_like_url(url) else None
     return None
 
 
 _AUTH_REQUIRE_DECORATORS = {
     "login_required", "requires_auth", "auth_required", "authenticated",
+    "jwt_required", "token_required",
 }
 _POLICY_DECORATOR_TOKENS = {
     "preauthorize", "roles_allowed", "permissions_required",
     "require_permission", "require_role", "policy",
+    "permission_required", "roles_required", "roles_accepted",
 }
 _EVENT_CONSUMER_DECORATORS = {
     "kafka_listener", "rabbit_listener", "subscriber", "subscribe",
     "consumer", "event_handler", "sqs_listener", "jms_listener",
 }
-_EVENT_EMIT_CALLS = {
-    "emit", "publish", "produce", "send", "send_event", "publish_event",
-    "dispatch", "dispatch_event",
+_EVENT_EMIT_CALLS_STRONG = {
+    "emit", "publish", "produce", "send_event", "publish_event", "dispatch_event",
 }
-_EVENT_CONSUME_CALLS = {
-    "subscribe", "consume", "listen", "add_listener", "on",
+_EVENT_EMIT_CALLS_GENERIC = {"send", "dispatch"}
+_EVENT_CONSUME_CALLS_STRONG = {"subscribe", "consume", "add_listener"}
+_EVENT_CONSUME_CALLS_GENERIC = {"listen", "on"}
+_EVENT_RECEIVER_HINTS = {
+    "bus", "broker", "producer", "consumer", "emitter", "events",
+    "event_bus", "kafka", "queue", "topic", "pubsub", "publisher", "channel",
 }
 
 
-def _auth_specs(dname: str, src: bytes, deco_node) -> list[tuple[str, str]]:
+def _auth_specs(dname: str, src: bytes, deco_node) -> list[tuple[str, str, bool]]:
     lower = (dname or "").lower()
-    out: list[tuple[str, str]] = []
-    if lower in _AUTH_REQUIRE_DECORATORS or "auth" in lower:
-        out.append(("REQUIRES_AUTH", "AUTH_REQUIRED"))
-    if lower in _POLICY_DECORATOR_TOKENS or any(t in lower for t in ("role", "permission", "policy", "scope")):
+    out: list[tuple[str, str, bool]] = []
+    if lower in _AUTH_REQUIRE_DECORATORS:
+        out.append(("REQUIRES_AUTH", "AUTH_REQUIRED", False))
+    elif "auth" in lower:
+        out.append(("REQUIRES_AUTH", "AUTH_REQUIRED", True))
+    if lower in _POLICY_DECORATOR_TOKENS:
         target = _decorator_policy_target(src, deco_node) or dname or "POLICY"
-        out.append(("ENFORCES_POLICY", target))
+        out.append(("ENFORCES_POLICY", target, False))
+    elif any(t in lower for t in ("role", "permission", "policy", "scope")):
+        target = _decorator_policy_target(src, deco_node) or dname or "POLICY"
+        out.append(("ENFORCES_POLICY", target, True))
     return out
 
 
@@ -896,34 +903,50 @@ def _decorator_policy_target(src: bytes, deco_node) -> str:
     return s.strip() if s else ""
 
 
-def _event_consumer_topic(dname: str, src: bytes, deco_node) -> str:
+def _event_consumer_topic(dname: str, src: bytes, deco_node) -> tuple[str, bool]:
     lower = (dname or "").lower()
-    if lower not in _EVENT_CONSUMER_DECORATORS and "listener" not in lower and "consumer" not in lower:
-        return ""
+    if lower in _EVENT_CONSUMER_DECORATORS:
+        fuzzy = False
+    elif "listener" in lower or "consumer" in lower:
+        fuzzy = True
+    else:
+        return "", False
     expr = deco_node.children[1] if len(deco_node.children) > 1 else None
     if expr is None or expr.type != "call":
-        return ""
-    return _string_arg(src, expr, 0).strip()
+        return "", False
+    return _string_arg(src, expr, 0).strip(), fuzzy
 
 
-def _outbound_event(src: bytes, call_node) -> str:
+def _outbound_event(src: bytes, call_node) -> tuple[str, bool]:
     fn = call_node.child_by_field_name("function")
     if fn is None:
-        return ""
+        return "", False
     tail = _dotted_tail(src, fn).lower()
-    if tail not in _EVENT_EMIT_CALLS:
-        return ""
-    return _string_arg(src, call_node, 0).strip()
+    if tail in _EVENT_EMIT_CALLS_STRONG:
+        return _string_arg(src, call_node, 0).strip(), False
+    if tail in _EVENT_EMIT_CALLS_GENERIC:
+        recv = _receiver(src, fn).lower()
+        topic = _string_arg(src, call_node, 0).strip()
+        if not topic:
+            return "", False
+        return topic, recv not in _EVENT_RECEIVER_HINTS
+    return "", False
 
 
-def _inbound_event(src: bytes, call_node) -> str:
+def _inbound_event(src: bytes, call_node) -> tuple[str, bool]:
     fn = call_node.child_by_field_name("function")
     if fn is None:
-        return ""
+        return "", False
     tail = _dotted_tail(src, fn).lower()
-    if tail not in _EVENT_CONSUME_CALLS:
-        return ""
-    return _string_arg(src, call_node, 0).strip()
+    if tail in _EVENT_CONSUME_CALLS_STRONG:
+        return _string_arg(src, call_node, 0).strip(), False
+    if tail in _EVENT_CONSUME_CALLS_GENERIC:
+        recv = _receiver(src, fn).lower()
+        topic = _string_arg(src, call_node, 0).strip()
+        if not topic:
+            return "", False
+        return topic, recv not in _EVENT_RECEIVER_HINTS
+    return "", False
 
 
 def _import_full_name(src: bytes, node) -> str:

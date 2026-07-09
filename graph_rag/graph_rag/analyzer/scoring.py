@@ -89,9 +89,20 @@ def qualify(store: GraphStore, repo: str, finding: Finding, llm=None,
 
 
 def severity(finding: Finding, endpoint_reachable: bool) -> float:
-    """severity = f(class_base, endpoint_reachable, qualified_blast_count).
-    Pure formula — same finding, same inputs, same number every run."""
-    base = SEVERITY_BASE.get(finding.subcategory, DEFAULT_SEVERITY_BASE)
+    """severity = f(base, endpoint_reachable, qualified_blast_count).
+
+    Base selection:
+      - graph_proven (deterministic, known taxonomy) → SEVERITY_BASE table.
+      - llm_judged with an LLM-assigned severity → that value (the table can't
+        know a free-form subcategory's weight; the reviewer that read the code
+        does). Falls back to the table, then DEFAULT, if the LLM gave none.
+    Multipliers are still pure formula — same inputs, same number every run."""
+    if finding.source == "graph_proven":
+        base = SEVERITY_BASE.get(finding.subcategory, DEFAULT_SEVERITY_BASE)
+    elif finding.llm_severity > 0:
+        base = finding.llm_severity
+    else:
+        base = SEVERITY_BASE.get(finding.subcategory, DEFAULT_SEVERITY_BASE)
     reach_factor = 1.0 if endpoint_reachable else 0.6
     blast_factor = 1.0
     if finding.blast_count > 0:

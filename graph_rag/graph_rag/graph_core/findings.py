@@ -1,8 +1,14 @@
 """Shared finding model for Stage 2 (Agent 1/2) and Stage 3 (scoring).
 
 Severity vs. confidence are deliberately separate axes (plan.md §11.1):
-    severity   — how bad if it's real. Set by Stage 3's formula, never by an
-                 agent directly (agents don't get to grade their own importance).
+    severity   — how bad if it's real. Stage 3 computes the final printed number
+                 from a BASE severity times blast/reachability multipliers.
+                 The base comes from SEVERITY_BASE for deterministic graph_proven
+                 classes (known taxonomy); for free-form llm_judged findings the
+                 LLM supplies the base directly (`llm_severity`), since the fixed
+                 table can't know the weight of a subcategory it's never seen.
+                 The formula still owns the multipliers — an agent can propose how
+                 bad the class is, but not how loud it finally prints.
     confidence — how sure we are it's real. Set by whichever pass produced the
                  finding; `source` says WHY that confidence should be trusted.
 
@@ -102,6 +108,7 @@ class Finding:
     evidence: str = ""
     recommendation: str = ""
     confidence: str = "MEDIUM"     # this pass's confidence the finding is real
+    llm_severity: float = 0.0      # base severity the LLM assigned (0 = not set)
     severity: float = 0.0          # filled by Stage 3; 0 until scored
     severity_label: str = ""       # CRITICAL|HIGH|MEDIUM|LOW, filled by Stage 3
     blast_count: int = 0
@@ -128,6 +135,7 @@ class Finding:
             "evidence": self.evidence,
             "recommendation": self.recommendation,
             "confidence": self.confidence,
+            "llm_severity": round(self.llm_severity, 2),
             "severity": round(self.severity, 2),
             "severity_label": self.severity_label,
             "blast_count": self.blast_count,
@@ -156,7 +164,31 @@ class Finding:
             evidence=str(d.get("evidence", "")).strip(),
             recommendation=str(d.get("recommendation", "")).strip(),
             confidence=confidence if confidence in CONFIDENCE_LEVELS else "MEDIUM",
+            llm_severity=_parse_severity(d.get("severity")),
         )
+
+
+# Band labels an LLM may emit instead of a number; mapped to the middle of each
+# band so the scoring formula's multipliers still have room to move it.
+_SEVERITY_BANDS = {
+    "CRITICAL": 9.0, "HIGH": 7.0, "MEDIUM": 5.0, "MED": 5.0, "LOW": 2.5, "INFO": 1.0,
+}
+
+
+def _parse_severity(raw) -> float:
+    """Coerce an LLM-supplied severity (number 0-10 or band label) to a float.
+    Returns 0.0 when absent/unparseable, meaning 'no LLM base — fall back'."""
+    if raw is None:
+        return 0.0
+    if isinstance(raw, (int, float)):
+        return max(0.0, min(float(raw), 10.0))
+    band = str(raw).strip().upper()
+    if band in _SEVERITY_BANDS:
+        return _SEVERITY_BANDS[band]
+    try:
+        return max(0.0, min(float(band), 10.0))
+    except ValueError:
+        return 0.0
 
 
 def dedupe(findings: list[Finding]) -> list[Finding]:

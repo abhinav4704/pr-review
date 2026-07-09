@@ -12,7 +12,14 @@ IGNORE_DIRS = {
     ".pytest_cache", ".mypy_cache", "site-packages",
 }
 
-EXT_LANG = {".java": "java", ".py": "python"}
+EXT_LANG = {
+    ".java": "java", ".py": "python", ".sql": "sql",
+    # JavaScript family (javascript grammar is JSX-aware)
+    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+    # TypeScript (.tsx needs the tsx grammar)
+    ".ts": "typescript", ".mts": "typescript", ".cts": "typescript",
+    ".tsx": "tsx",
+}
 
 
 @dataclass

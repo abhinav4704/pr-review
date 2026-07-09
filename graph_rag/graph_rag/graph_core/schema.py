@@ -21,6 +21,7 @@ NODE_LABELS = {
     "Endpoint",     # an HTTP endpoint (method + route); in-repo or external
     "Event",        # an event/topic/queue semantic node
     "Policy",       # auth/policy contract node (role/scope/policy marker)
+    "Table",        # a SQL table (CREATE TABLE); columns stored as JSON property
 }
 
 EDGE_TYPES = {

@@ -21,19 +21,20 @@ import os
 import sys
 from collections import Counter
 
-from graph_rag import extractors
-from graph_rag.canonical_ir import from_extractor, merge_bundles
-from graph_rag.discovery import discover
-from graph_rag.models import Node, RawRef
-from graph_rag.pipeline import (
+from graph_rag.graph_core import extractors
+from graph_rag.graph_core.canonical_ir import from_extractor, merge_bundles
+from graph_rag.graph_core.dataflow import run_dataflow
+from graph_rag.graph_core.discovery import discover
+from graph_rag.graph_core.models import Node, RawRef
+from graph_rag.graph_core.pipeline import (
     _attach_call_metrics,
     _build_package_tree,
     _classify_roles,
     _derive_module_ownership_and_uses,
     _derive_overrides,
 )
-from graph_rag.resolver import resolve
-from graph_rag.validator import validate_graph
+from graph_rag.graph_core.resolver import resolve
+from graph_rag.graph_core.validator import validate_graph
 
 REPO = "fixtures"
 
@@ -52,6 +53,18 @@ def build_graph(root: str):
     nodes = [*nodes, *extra_nodes]
     edges = [*edges, *resolved_edges]
 
+    # DFG: replace extractor PASSES with dataflow-computed PASSES
+    dfg_result = run_dataflow(files, nodes, edges, REPO)
+    edges = [e for e in edges if e.type != "PASSES"]
+    edges.extend(dfg_result.passes_edges)
+    nodes_by_id = {n.id: n for n in nodes}
+    for fn_id, props in dfg_result.node_props.items():
+        fn_node = nodes_by_id.get(fn_id)
+        if fn_node is not None:
+            fn_node.dfg_json = props.get("dfg_json", "")
+            fn_node.dfg_returns_from_params = props.get("dfg_returns_from_params", [])
+            fn_node.dfg_hash = props.get("dfg_hash", "")
+
     edges += _derive_overrides(nodes, edges)
     pkg_nodes, pkg_edges = _build_package_tree(nodes, REPO)
     nodes += pkg_nodes
@@ -64,7 +77,7 @@ def build_graph(root: str):
 
     _attach_call_metrics(nodes, edges)
     validation = validate_graph(nodes, edges)
-    return files, nodes, edges, validation, role_diag
+    return files, nodes, edges, validation, role_diag, dfg_result
 
 
 # --- checks ----------------------------------------------------------------
@@ -116,7 +129,7 @@ def references_resolver_check(chk: Checks) -> None:
 
 def main() -> int:
     root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "fixtures")
-    files, nodes, edges, validation, role_diag = build_graph(root)
+    files, nodes, edges, validation, role_diag, dfg_result = build_graph(root)
     by_id = {n.id: n for n in nodes}
 
     edge_counts = Counter(e.type for e in edges)
@@ -170,6 +183,111 @@ def main() -> int:
 
     # REFERENCES dotted-tail fallback (resolver-level).
     references_resolver_check(chk)
+
+    # Phase 1 — heuristic downgrade assertions.
+
+    # No Endpoint node created for session.get("cache_key") — URL guard must filter it.
+    cache_endpoints = [n for n in nodes if n.label == "Endpoint" and "cache_key" in (n.route or "")]
+    chk.expect(len(cache_endpoints) == 0, f"no Endpoint with cache_key route (got {len(cache_endpoints)})")
+
+    # fuzzy_name edges must carry AMBIGUOUS confidence.
+    fuzzy_non_ambiguous = [
+        e for e in edges
+        if e.type in ("EMITS_EVENT", "CONSUMES_EVENT", "REQUIRES_AUTH", "ENFORCES_POLICY")
+        and getattr(e, "strategy", "") == "fuzzy_name"
+        and e.confidence != "AMBIGUOUS"
+    ]
+    chk.expect(
+        len(fuzzy_non_ambiguous) == 0,
+        f"all fuzzy_name edges have AMBIGUOUS confidence (violations: {len(fuzzy_non_ambiguous)})",
+    )
+
+    # noise.py: smtp.send("hello") and button.on("click") produce only fuzzy edges to those events.
+    hello_edges = [
+        e for e in edges
+        if e.type == "EMITS_EVENT" and by_id.get(e.dst) is not None
+        and by_id[e.dst].label == "Event"
+        and by_id[e.dst].name in ("hello", "hello.", "hel.lo")
+    ]
+    # Actually check by display_name or raw target (normalize "hello" → "hello")
+    hello_event_ids = {n.id for n in nodes if n.label == "Event" and n.name == "hello"}
+    click_event_ids = {n.id for n in nodes if n.label == "Event" and n.name == "click"}
+    hello_non_fuzzy = [e for e in edges if e.type == "EMITS_EVENT" and e.dst in hello_event_ids
+                       and getattr(e, "strategy", "") != "fuzzy_name"]
+    click_non_fuzzy = [e for e in edges if e.type == "CONSUMES_EVENT" and e.dst in click_event_ids
+                       and getattr(e, "strategy", "") != "fuzzy_name"]
+    chk.expect(len(hello_non_fuzzy) == 0, f"'hello' event edges are all fuzzy (non-fuzzy: {len(hello_non_fuzzy)})")
+    chk.expect(len(click_non_fuzzy) == 0, f"'click' event edges are all fuzzy (non-fuzzy: {len(click_non_fuzzy)})")
+
+    # No node has component_role == "helper".
+    helpers = [n for n in nodes if n.component_role == "helper"]
+    chk.expect(len(helpers) == 0, f"no node has component_role='helper' (got {len(helpers)})")
+
+    # com.acme.reports.ReportGenerator must NOT have repository role.
+    acme_reports = [n for n in nodes if "acme" in (n.fqn or "") and "reports" in (n.fqn or "")]
+    acme_repo_roles = [n for n in acme_reports if n.component_role == "repository"]
+    chk.expect(
+        len(acme_repo_roles) == 0,
+        f"com.acme.reports class has no repository role (got {len(acme_repo_roles)})",
+    )
+
+    # Event normalization: "OrderPlaced" and "order_placed" must map to the same Event node.
+    order_placed_events = [
+        n for n in nodes if n.label == "Event" and n.name == "order.placed"
+    ]
+    chk.expect(
+        len(order_placed_events) == 1,
+        f"exactly ONE Event node for order.placed (normalized from OrderPlaced/order_placed): got {len(order_placed_events)}",
+    )
+    if order_placed_events:
+        chk.expect(
+            bool(order_placed_events[0].display_name),
+            f"Event node order.placed has display_name set (got '{order_placed_events[0].display_name}')",
+        )
+
+    # Phase 2 — DFG assertions.
+
+    # PASSES edges must now carry non-empty flow_from_param and flow_to_param.
+    passes_with_flow = [
+        e for e in edges
+        if e.type == "PASSES"
+        and getattr(e, "flow_from_param", None)
+        and getattr(e, "flow_to_param", None)
+    ]
+    chk.at_least(len(passes_with_flow), 4, "PASSES edges with non-empty flow_from_param and flow_to_param")
+
+    # The Handler.handle -> FlowService.process edge must have param 0 flowing.
+    handler_service_edges = [
+        e for e in edges
+        if e.type == "PASSES"
+        and by_id.get(e.src) is not None
+        and by_id[e.src].name == "handle"
+        and by_id.get(e.dst) is not None
+        and by_id[e.dst].name == "process"
+        and 0 in getattr(e, "flow_from_param", [])
+    ]
+    chk.at_least(len(handler_service_edges), 1, "Handler.handle->FlowService.process PASSES has flow_from_param[0]")
+
+    # echo() must have dfg_returns_from_params == [0].
+    echo_fns = [n for n in nodes if n.label == "Function" and n.name == "echo"
+                and n.dfg_returns_from_params == [0]]
+    chk.at_least(len(echo_fns), 1, "echo function has dfg_returns_from_params=[0]")
+
+    # DataStore.save() must have a field write (self.last_data <- param 0).
+    save_fns = [n for n in nodes if n.label == "Function" and n.name == "save"
+                and n.dfg_json]
+    save_field_writes = []
+    if save_fns:
+        import json as _json
+        for fn in save_fns:
+            try:
+                summary = _json.loads(fn.dfg_json)
+                for fw in summary.get("field_writes", []):
+                    if 0 in fw.get("from_params", []):
+                        save_field_writes.append(fw)
+            except Exception:
+                pass
+    chk.at_least(len(save_field_writes), 1, "DataStore.save has field_write self.last_data from param 0")
 
     # Graph must stay structurally valid.
     errors = validation.get("errors", []) if isinstance(validation, dict) else []

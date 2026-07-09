@@ -42,6 +42,7 @@ _REST_TEMPLATE_CALLS = {
 
 _AUTH_REQUIRE_ANNOTATIONS = {
     "Authenticated", "AuthenticationPrincipal", "LoginRequired",
+    "RequiresAuthentication",
 }
 # Spring/Jakarta DI annotations that mark a field/constructor param as an
 # injected dependency -> emitted as an AUTOWIRED type-shaped ref (schema.py
@@ -51,15 +52,20 @@ _AUTH_REQUIRE_ANNOTATIONS = {
 _JAVA_AUTOWIRE_ANNOTATIONS = {"Autowired", "Inject", "Resource"}
 _POLICY_ANNOTATIONS = {
     "PreAuthorize", "Secured", "RolesAllowed", "PermissionsAllowed",
+    "RequiresRoles", "RequiresPermissions",
 }
 _EVENT_CONSUMER_ANNOTATIONS = {
     "KafkaListener", "RabbitListener", "JmsListener", "SqsListener",
 }
-_EVENT_EMIT_METHODS = {
-    "publish", "emit", "send", "produce", "dispatch", "publishEvent",
+_EVENT_EMIT_METHODS_STRONG = {
+    "publish", "emit", "produce", "publishEvent", "dispatch",
 }
-_EVENT_CONSUME_METHODS = {
-    "subscribe", "consume", "listen", "registerListener", "on",
+_EVENT_EMIT_METHODS_GENERIC = {"send"}
+_EVENT_CONSUME_METHODS_STRONG = {"subscribe", "consume", "registerListener"}
+_EVENT_CONSUME_METHODS_GENERIC = {"listen", "on"}
+_JAVA_EVENT_RECEIVER_HINTS = {
+    "bus", "broker", "producer", "consumer", "emitter", "events",
+    "eventBus", "kafka", "queue", "topic", "pubsub", "publisher", "channel",
 }
 
 _TYPE_DECLS = {
@@ -104,13 +110,14 @@ def extract(file: FileInfo, repo: str):
             evidence_col=child_node.start_point[1],
         ))
 
-    def ref(rtype, src_id, target, kind_hint, node, recv="", call_arity=-1, arg_names=None):
+    def ref(rtype, src_id, target, kind_hint, node, recv="", call_arity=-1, arg_names=None, strategy_hint=""):
         refs.append(RawRef(
             rtype, src_id, target, kind_hint, recv=recv,
             ref_file=file.relpath,
             ref_line=node.start_point[0] + 1, ref_col=node.start_point[1],
             call_arity=call_arity,
             arg_names=list(arg_names or []),
+            strategy_hint=strategy_hint,
         ))
 
     def emit_endpoint(method, route, handler_id, ev_node):
@@ -208,7 +215,7 @@ def extract(file: FileInfo, repo: str):
         for ann in anns:
             ref("ANNOTATED_WITH", cid, ann, "annotation", node)
         for et in _java_auth_policy_specs(src, node):
-            ref(et[0], cid, et[1], "policy", node)
+            ref(et[0], cid, et[1], "policy", node, strategy_hint="fuzzy_name" if et[2] else "")
 
         sc = node.child_by_field_name("superclass")
         if sc:
@@ -289,7 +296,7 @@ def extract(file: FileInfo, repo: str):
         for ann in anns:
             ref("ANNOTATED_WITH", mid, ann, "annotation", node)
         for et in _java_auth_policy_specs(src, node):
-            ref(et[0], mid, et[1], "policy", node)
+            ref(et[0], mid, et[1], "policy", node, strategy_hint="fuzzy_name" if et[2] else "")
         for topic in _java_event_consumer_topics(src, node):
             ref("CONSUMES_EVENT", mid, topic, "event", node)
         for method, route in _spring_endpoints(src, node, route_prefix):
@@ -331,25 +338,17 @@ def extract(file: FileInfo, repo: str):
                             d,
                             call_arity=_call_arity(d),
                         )
-                        if pass_args:
-                            ref(
-                                "PASSES",
-                                mid,
-                                text(src, nm),
-                                "call",
-                                d,
-                                call_arity=_call_arity(d),
-                                arg_names=pass_args,
-                            )
                         ob = _outbound_java(src, d, text(src, nm))
                         if ob is not None:
                             emit_api_call(mid, ob[0], ob[1], d)
-                        ev = _outbound_event_java(src, d, text(src, nm))
-                        if ev:
-                            ref("EMITS_EVENT", mid, ev, "event", d)
-                        evc = _inbound_event_java(src, d, text(src, nm))
-                        if evc:
-                            ref("CONSUMES_EVENT", mid, evc, "event", d)
+                        ev_result = _outbound_event_java(src, d, text(src, nm))
+                        if ev_result[0]:
+                            ref("EMITS_EVENT", mid, ev_result[0], "event", d,
+                                strategy_hint="fuzzy_name" if ev_result[1] else "")
+                        evc_result = _inbound_event_java(src, d, text(src, nm))
+                        if evc_result[0]:
+                            ref("CONSUMES_EVENT", mid, evc_result[0], "event", d,
+                                strategy_hint="fuzzy_name" if evc_result[1] else "")
                 elif d.type == "object_creation_expression":
                     tp = d.child_by_field_name("type")
                     if tp:
@@ -632,16 +631,37 @@ def _outbound_java(src: bytes, call_node, name: str):
     return None
 
 
-def _outbound_event_java(src: bytes, call_node, name: str) -> str:
-    if name not in _EVENT_EMIT_METHODS:
+def _java_recv_tail(call_node) -> str:
+    """Tail name of the method invocation's object (receiver)."""
+    obj = call_node.child_by_field_name("object")
+    if obj is None:
         return ""
-    return _first_string_arg(src, call_node, 0)
+    raw = obj.text.decode("utf-8", "replace") if obj.text else ""
+    return raw.split(".")[-1] if raw else ""
 
 
-def _inbound_event_java(src: bytes, call_node, name: str) -> str:
-    if name not in _EVENT_CONSUME_METHODS:
-        return ""
-    return _first_string_arg(src, call_node, 0)
+def _outbound_event_java(src: bytes, call_node, name: str) -> tuple[str, bool]:
+    if name in _EVENT_EMIT_METHODS_STRONG:
+        return _first_string_arg(src, call_node, 0), False
+    if name in _EVENT_EMIT_METHODS_GENERIC:
+        recv = _java_recv_tail(call_node)
+        topic = _first_string_arg(src, call_node, 0)
+        if not topic:
+            return "", False
+        return topic, recv not in _JAVA_EVENT_RECEIVER_HINTS
+    return "", False
+
+
+def _inbound_event_java(src: bytes, call_node, name: str) -> tuple[str, bool]:
+    if name in _EVENT_CONSUME_METHODS_STRONG:
+        return _first_string_arg(src, call_node, 0), False
+    if name in _EVENT_CONSUME_METHODS_GENERIC:
+        recv = _java_recv_tail(call_node)
+        topic = _first_string_arg(src, call_node, 0)
+        if not topic:
+            return "", False
+        return topic, recv not in _JAVA_EVENT_RECEIVER_HINTS
+    return "", False
 
 
 def _first_string_arg(src: bytes, call_node, index: int) -> str:
@@ -654,19 +674,24 @@ def _first_string_arg(src: bytes, call_node, index: int) -> str:
     return _str_lit(src, pos[index]).strip()
 
 
-def _java_auth_policy_specs(src: bytes, node) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
+def _java_auth_policy_specs(src: bytes, node) -> list[tuple[str, str, bool]]:
+    out: list[tuple[str, str, bool]] = []
     for ann in _annotation_nodes(node):
         nm = ann.child_by_field_name("name")
         if nm is None:
             continue
         name = simple_type_name(text(src, nm))
         low = name.lower()
-        if name in _AUTH_REQUIRE_ANNOTATIONS or "auth" in low:
-            out.append(("REQUIRES_AUTH", "AUTH_REQUIRED"))
-        if name in _POLICY_ANNOTATIONS or any(t in low for t in ("role", "permission", "policy", "scope", "authorize", "secured")):
+        if name in _AUTH_REQUIRE_ANNOTATIONS:
+            out.append(("REQUIRES_AUTH", "AUTH_REQUIRED", False))
+        elif "auth" in low:
+            out.append(("REQUIRES_AUTH", "AUTH_REQUIRED", True))
+        if name in _POLICY_ANNOTATIONS:
             target = _annotation_policy_value(src, ann) or name or "POLICY"
-            out.append(("ENFORCES_POLICY", target))
+            out.append(("ENFORCES_POLICY", target, False))
+        elif any(t in low for t in ("role", "permission", "policy", "scope", "authorize", "secured")):
+            target = _annotation_policy_value(src, ann) or name or "POLICY"
+            out.append(("ENFORCES_POLICY", target, True))
     return out
 
 

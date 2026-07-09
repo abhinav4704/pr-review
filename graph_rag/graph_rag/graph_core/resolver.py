@@ -14,6 +14,7 @@ no match -> unresolved (counted, no edge). Annotations are materialized as
 """
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -410,8 +411,13 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
                 extra_nodes.append(Node(
                     id=eid, label="Event", name=topic,
                     fqn=f"event://{topic}", repo=repo, kind="event",
+                    display_name=ref.target_name,
                 ))
-            out_edges.append(make_edge(ref, eid, Confidence.EXTRACTED.value, strategy="event_marker"))
+            if ref.strategy_hint == "fuzzy_name":
+                conf, strat = Confidence.AMBIGUOUS.value, "fuzzy_name"
+            else:
+                conf, strat = Confidence.EXTRACTED.value, "event_marker"
+            out_edges.append(make_edge(ref, eid, conf, strategy=strat))
             cov.resolved += 1
             continue
 
@@ -427,7 +433,11 @@ def resolve(nodes: list[Node], edges: list[Edge], refs: list[RawRef], repo: str)
                     id=pid, label="Policy", name=pname,
                     fqn=f"policy://{pname}", repo=repo, kind="policy",
                 ))
-            out_edges.append(make_edge(ref, pid, Confidence.EXTRACTED.value, strategy="auth_marker"))
+            if ref.strategy_hint == "fuzzy_name":
+                conf, strat = Confidence.AMBIGUOUS.value, "fuzzy_name"
+            else:
+                conf, strat = Confidence.EXTRACTED.value, "auth_marker"
+            out_edges.append(make_edge(ref, pid, conf, strategy=strat))
             cov.resolved += 1
             continue
 
@@ -654,11 +664,19 @@ def _normalize_event_name(name: str) -> str:
     n = (name or "").strip().strip("\"'")
     if not n:
         return ""
-    return n
+    n = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", ".", n)
+    n = n.lower()
+    n = re.sub(r"[_\-/:]+|\s+", ".", n)
+    n = re.sub(r"\.{2,}", ".", n)
+    return n.strip(".")
 
 
 def _normalize_policy_name(name: str) -> str:
     n = (name or "").strip().strip("\"'")
     if not n:
         return ""
-    return n.upper()
+    n = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", ".", n)
+    n = n.lower()
+    n = re.sub(r"[_\-/:]+|\s+", ".", n)
+    n = re.sub(r"\.{2,}", ".", n)
+    return n.strip(".")

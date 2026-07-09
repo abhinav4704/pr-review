@@ -36,3 +36,7 @@ def on_order_shipped(record):
 
 def archive(record):
     return record
+
+
+def requeue_order(queue):
+    queue.emit("order_placed")    # EMITS_EVENT "order_placed" -> normalizes to order.placed

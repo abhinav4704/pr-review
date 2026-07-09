@@ -15,633 +15,57 @@ rag/semantic.py). Per the user's explicit pivot, both now read each
 function's actual raw source instead — no flow/identity generation is used
 by the analyzer at all.
 
-Python-first (v1 scope). Deliberately coarse, over-approximating value taint
-at argument granularity — tracks which local variables textually derive from
-which parameters (simple identifier aliasing, no CFG, no field/container
-sensitivity), and where those flow into call arguments or return statements.
-It will over-report; precision comes back in the qualify step, not here.
+Phase 3 change: taint composition now reads per-function DFG summaries from
+the graph (dfg_json, written at index time by graph_core/dataflow.py) instead
+of re-running tree-sitter AST analysis at query time. Sink classification
+happens here at walk time via sinks.SinkCatalog, so changing the sink list
+no longer requires re-indexing.
 
 Passes, in order:
-    1. `run_taint_pass`       — deterministic transfer-function + sink
-                                extraction (tree-sitter, no LLM). Cached by
-                                body_hash.
-    2. `tag_sanitizers`       — one cached LLM call per *candidate* function
-                                only (name suggests validation, or another
-                                function's transfer facts actually call
-                                through it). Reads raw source, not flows.
-    3. `find_taint_findings`  — composition: walk transfer facts from each
-                                Endpoint-handler param to a sink, no LLM.
-    4. `run_taint_qualify`    — LLM confirms/denies each composed finding by
-                                reading the RAW SOURCE of every function in
-                                the source->sink chain.
-    5. `run_architecture_pass` — Stage 1 (bulk, cheap, one batched call):
-                                collapse call chains from every
-                                endpoint_handler root onto role-sequence
-                                "shapes"; flag risky ones. Stage 2 (targeted,
-                                one call per flagged shape): read the RAW
-                                SOURCE of the shape's representative chain
-                                and produce anchored findings. Plus a fully
-                                deterministic whole-graph cycle sweep
-                                (`find_unreached_cycles`) that catches cycles
-                                invisible to endpoint-rooted walks.
+    1. `find_taint_findings`   — walk DFG facts from each endpoint-handler
+                                 param to a sink (graph_proven, no LLM).
+    2. `tag_sanitizers`        — one cached LLM call per *candidate* function
+                                 only (name suggests validation, or another
+                                 function's transfer facts actually call
+                                 through it). Reads raw source, not flows.
+    3. `run_taint_qualify`     — LLM confirms/denies each composed finding by
+                                 reading the RAW SOURCE of every function in
+                                 the source->sink chain.
+    4. `run_architecture_pass` — Stage 1 (bulk, cheap, one batched call):
+                                 collapse call chains from every
+                                 endpoint_handler root onto role-sequence
+                                 "shapes"; flag risky ones. Stage 2 (targeted,
+                                 one call per flagged shape): read the RAW
+                                 SOURCE of the shape's representative chain
+                                 and produce anchored findings. Plus a fully
+                                 deterministic whole-graph cycle sweep
+                                 (`find_unreached_cycles`) that catches cycles
+                                 invisible to endpoint-rooted walks.
 
 Known v1 limitations (name them, don't hide them):
-    - Return-flow is propagated conservatively WITHIN one function only: if
-      `x = foo(tainted_arg)`, `x` is treated as tainted from then on in the
-      SAME function (over-approximation, not proof that `foo` actually
-      returns its argument) — closes the common "A calls B, B returns it, A
-      uses the return" case without a full cross-function return-taint
-      solver.
     - Callee resolution for composition prefers the graph's own resolved
       CALLS edges from the caller when present, falling back to bare-name
       matching only when no resolved edge exists.
-    - `*args`/`**kwargs` call-site splats are recorded but NOT precisely
-      mapped to a callee parameter when dynamic (non-literal) — composition
-      does not cross into the callee through them.
+    - `*args`/`**kwargs` call-site splats recorded in dfg_json without a
+      static-resolvable keyword are skipped by composition (arg_keyword "*"
+      or "**" → _resolve_arg_position returns None).
 """
 from __future__ import annotations
 
 import json
 import os
 from collections import defaultdict
-from dataclasses import dataclass, field
 
-from ..graph_core.discovery import discover
-from ..graph_core.extractors.common import iter_descendants, text
 from ..graph_core.findings import Finding
-from ..graph_core.languages import get_parser
 from ..graph_core.store import GraphStore
 from .context import file_imports_block, shared_state_for_ids
-from .scoring import score_findings
-
-# Well-known Python builtins that are terminal/side-effect-free wrt taint
-# propagation — passing a tainted value into these never itself constitutes
-# an untraceable "external" continuation worth flagging. Without this, a
-# call like `list(conn.execute(sql))` would spuriously flag `list` as an
-# unresolved-external taint flow: the identifier scan that builds `passes`
-# facts walks all identifiers nested in a call's argument expression, so it
-# sees `sql` as "passed to list" even though `sql` is actually consumed by
-# the inner (already-classified) `conn.execute(sql)` sink call, not by
-# `list` itself. Real 3rd-party/library calls not in this list still flag.
-_TAINT_INERT_BUILTINS = frozenset({
-    "list", "str", "dict", "set", "tuple", "sorted", "len", "int", "float",
-    "bool", "repr", "print", "iter", "next", "reversed", "enumerate", "zip",
-    "map", "filter", "frozenset", "bytes", "bytearray", "format", "hash",
-    "min", "max", "sum", "any", "all", "abs", "round",
-})
-
-# --- sink taxonomy (deterministic; matched against the call's dotted-tail name) ---
-SINK_PATTERNS: dict[str, tuple[str, ...]] = {
-    "sql_injection": (
-        "execute", "executemany", "raw", "rawquery", "executescript",
-        # Java JDBC (Statement/PreparedStatement) additions.
-        "executequery", "executeupdate", "executebatch", "executelargeupdate",
-    ),
-    "command_injection": (
-        "system", "popen", "call", "run", "spawn", "getoutput",
-        "check_output", "check_call", "popen2", "popen3", "popen4",
-        # Java (Runtime.getRuntime().exec(...) / ProcessBuilder.start()).
-        "exec",
-    ),
-    "deserialization": ("loads", "load", "unpickle", "yaml_load", "read_pickle"),
-    "path_traversal": (
-        "open", "sendfile", "send_file", "remove", "unlink", "rmtree",
-        "extractall", "read_text", "write_text", "readlink",
-    ),
-    "eval_injection": ("eval", "exec", "compile"),
-    "ssrf": ("get", "post", "put", "delete", "request", "urlopen", "fetch"),
-    "template_injection": ("render_template_string", "from_string"),
-    "xss": ("mark_safe", "Markup"),
-    "open_redirect": ("redirect", "HttpResponseRedirect"),
-    # NoSQL / directory-service / XML / logging / crypto sinks — all common-word
-    # names, so every one of these MUST have a receiver hint below or it will
-    # false-positive constantly.
-    "nosql_injection": (
-        "find", "find_one", "find_one_and_update", "find_one_and_delete",
-        "aggregate", "update_many", "update_one", "delete_many", "delete_one",
-        "insert_many",
-    ),
-    "ldap_injection": ("search_s", "search", "bind_s"),
-    "xxe": ("parse", "fromstring", "iterparse"),
-    "sensitive_data_exposure": ("debug", "info", "warning", "warn", "error", "exception", "critical"),
-    "crypto_misuse": ("encrypt", "decrypt", "new"),
-}
-
-# Some sink names above are common English words (open/get/post/find/search/...)
-# — narrow them by receiver so plain local helpers/methods don't false-positive.
-_SINK_RECEIVER_HINTS: dict[str, tuple[str, ...]] = {
-    "path_traversal": ("os", "shutil", "", "zipfile", "tarfile", "pathlib"),
-    "ssrf": ("requests", "urllib", "http", "httpx", "aiohttp", "session"),
-    "nosql_injection": ("collection", "db", "mongo", "mongodb", "client", "coll"),
-    "ldap_injection": ("ldap", "conn", "connection", "server"),
-    "xxe": ("etree", "lxml", "xml", "sax", "minidom", "elementtree"),
-    "sensitive_data_exposure": ("logger", "log", "logging"),
-    "crypto_misuse": ("cipher", "aes", "des", "rsa", "crypto", "cryptography"),
-}
-
-import re as _re
-
-_SANITIZER_NAME_HINTS = _re.compile(
-    r"(sanitiz|escape|clean|validate|quote|encode|strip_tags|whitelist|allowlist)", _re.I
+from .sinks import (
+    DANGEROUS_EXTERNAL_RECEIVERS,
+    SANITIZER_HINTS,
+    TAINT_INERT_BUILTINS,
+    SinkCatalog,
+    load_sinks,
 )
-
-
-def classify_sink(recv: str, name: str) -> str | None:
-    name_l = (name or "").lower()
-    recv_l = (recv or "").lower()
-    for vuln_class, names in SINK_PATTERNS.items():
-        if name_l not in names:
-            continue
-        hints = _SINK_RECEIVER_HINTS.get(vuln_class)
-        if hints is None or recv_l in hints:
-            return vuln_class
-    return None
-
-
-def _callee_parts(src: bytes, fn_node) -> tuple[str, str]:
-    """(receiver_tail, call_name) for a call's function expression.
-    `conn.execute(...)` -> ("conn", "execute"); `eval(...)` -> ("", "eval")."""
-    if fn_node.type == "attribute":
-        obj = fn_node.child_by_field_name("object")
-        attr = fn_node.child_by_field_name("attribute")
-        recv = text(src, obj) if obj is not None else ""
-        recv_tail = recv.rsplit(".", 1)[-1] if recv else ""
-        return recv_tail, text(src, attr) if attr is not None else ""
-    if fn_node.type == "identifier":
-        return "", text(src, fn_node)
-    return "", ""
-
-
-def _identifiers(src: bytes, node) -> set[str]:
-    out: set[str] = set()
-    if node.type == "identifier":
-        out.add(text(src, node))
-    for d in iter_descendants(node):
-        if d.type == "identifier":
-            out.add(text(src, d))
-    return out
-
-
-def _own_scope(node):
-    """Yield node's descendants, but do not descend into nested def/class bodies
-    — matches python.py's own per-scope CALLS attribution philosophy."""
-    stack = list(reversed(node.children))
-    while stack:
-        cur = stack.pop()
-        yield cur
-        if cur.type not in ("function_definition", "class_definition"):
-            stack.extend(reversed(cur.children))
-
-
-def _call_lhs_assign_target(call_node, src: bytes) -> str:
-    """If `call_node` is the RHS of a plain `x = call(...)` assignment, return
-    'x'; else ''. Used for same-function conservative return-flow propagation."""
-    parent = call_node.parent
-    if parent is None or parent.type != "assignment":
-        return ""
-    right = parent.child_by_field_name("right")
-    left = parent.child_by_field_name("left")
-    if right is None or left is None or right.id != call_node.id:
-        return ""
-    if left.type != "identifier":
-        return ""
-    return text(src, left)
-
-
-def _splat_literal_entries(src: bytes, splat_node):
-    """If a `*`/`**` call-site splat wraps a literal list/tuple/dict, return
-    its individual (kind, key, value_node) entries so they can be mapped like
-    normal positional/keyword args instead of falling back to an unmapped
-    marker. kind is 'pos' or 'kw'; key is None for 'pos'. Returns None when the
-    splat wraps something dynamic (a variable, another call, etc.) — those
-    remain a genuine, unmappable static-analysis limitation."""
-    children = [c for c in splat_node.children if c.type not in ("*", "**")]
-    if not children:
-        return None
-    expr = children[0]
-    if expr.type in ("list", "tuple"):
-        entries = []
-        for el in expr.children:
-            if el.type in ("[", "]", "(", ")", ","):
-                continue
-            entries.append(("pos", None, el))
-        return entries
-    if expr.type == "dictionary":
-        entries = []
-        for pair in expr.children:
-            if pair.type != "pair":
-                continue
-            key_node = pair.child_by_field_name("key")
-            val_node = pair.child_by_field_name("value")
-            if key_node is None or val_node is None:
-                continue
-            entries.append(("kw", text(src, key_node).strip("'\""), val_node))
-        return entries
-    return None
-
-
-@dataclass
-class FunctionTaint:
-    sinks: list[dict] = field(default_factory=list)
-    passes: list[dict] = field(default_factory=list)
-    returns_from_params: list[int] = field(default_factory=list)
-
-    def to_json(self) -> str:
-        return json.dumps({
-            "sinks": self.sinks,
-            "passes": self.passes,
-            "returns_from_params": self.returns_from_params,
-        }, sort_keys=True)
-
-
-def analyze_function(src: bytes, func_node, param_names: list[str]) -> FunctionTaint:
-    """Compute this function's taint transfer facts. `tainted` maps a variable
-    name -> the set of param indices it currently derives from; seeded with
-    each param naming itself."""
-    result = FunctionTaint()
-    tainted: dict[str, set[int]] = {p: {i} for i, p in enumerate(param_names) if p}
-
-    body = func_node.child_by_field_name("body")
-    if body is None:
-        return result
-
-    for node in _own_scope(body):
-        if node.type == "assignment":
-            lhs = node.child_by_field_name("left")
-            rhs = node.child_by_field_name("right")
-            if lhs is None or rhs is None or lhs.type != "identifier":
-                continue
-            contributing: set[int] = set()
-            for rid in _identifiers(src, rhs):
-                contributing |= tainted.get(rid, set())
-            if contributing:
-                lname = text(src, lhs)
-                tainted[lname] = tainted.get(lname, set()) | contributing
-
-        elif node.type == "call":
-            fn_node = node.child_by_field_name("function")
-            args_node = node.child_by_field_name("arguments")
-            if fn_node is None or args_node is None:
-                continue
-            recv, name = _callee_parts(src, fn_node)
-            if not name:
-                continue
-            vuln_class = classify_sink(recv, name)
-            call_contributing: set[int] = set()   # union across all tainted args
-                                                   # (feeds same-function return propagation below)
-            pos = 0
-            for c in args_node.children:
-                if c.type in ("(", ")", ","):
-                    continue
-                if c.type == "keyword_argument":
-                    kw_name_node = c.child_by_field_name("name")
-                    kw_val_node = c.child_by_field_name("value")
-                    kw_name = text(src, kw_name_node) if kw_name_node else ""
-                    contributing = set()
-                    if kw_val_node is not None:
-                        for aid in _identifiers(src, kw_val_node):
-                            contributing |= tainted.get(aid, set())
-                    if contributing:
-                        call_contributing |= contributing
-                        if vuln_class:
-                            result.sinks.append({
-                                "vuln_class": vuln_class,
-                                "callee": f"{recv}.{name}" if recv else name,
-                                "line": node.start_point[0] + 1,
-                                "from_params": sorted(contributing),
-                            })
-                        else:
-                            result.passes.append({
-                                "callee": name,
-                                "arg_position": None,
-                                "arg_keyword": kw_name,
-                                "from_params": sorted(contributing),
-                            })
-                    continue
-                if c.type in ("list_splat", "dictionary_splat"):
-                    literal_entries = _splat_literal_entries(src, c)
-                    if literal_entries is not None:
-                        # Literal `*[...]`/`**{...}` — its entries are
-                        # statically known, so map each one like a normal
-                        # positional/keyword arg instead of an unmapped
-                        # marker.
-                        for kind, key, val_node in literal_entries:
-                            contributing = set()
-                            for aid in _identifiers(src, val_node):
-                                contributing |= tainted.get(aid, set())
-                            if contributing:
-                                call_contributing |= contributing
-                                if vuln_class:
-                                    result.sinks.append({
-                                        "vuln_class": vuln_class,
-                                        "callee": f"{recv}.{name}" if recv else name,
-                                        "line": node.start_point[0] + 1,
-                                        "from_params": sorted(contributing),
-                                    })
-                                elif kind == "pos":
-                                    result.passes.append({
-                                        "callee": name,
-                                        "arg_position": None,
-                                        "arg_keyword": None,
-                                        "from_params": sorted(contributing),
-                                    })
-                                else:
-                                    result.passes.append({
-                                        "callee": name,
-                                        "arg_position": None,
-                                        "arg_keyword": key,
-                                        "from_params": sorted(contributing),
-                                    })
-                            if kind == "pos":
-                                pos += 1
-                        continue
-                    # Dynamic (non-literal) splat — the target parameter can't
-                    # be determined syntactically, so record it as an unmapped
-                    # pass (composition won't cross into the callee through
-                    # it, but same-function return propagation below still
-                    # applies). This remains a genuine, documented blind spot.
-                    contributing = set()
-                    for aid in _identifiers(src, c):
-                        contributing |= tainted.get(aid, set())
-                    if contributing:
-                        call_contributing |= contributing
-                        if vuln_class:
-                            result.sinks.append({
-                                "vuln_class": vuln_class,
-                                "callee": f"{recv}.{name}" if recv else name,
-                                "line": node.start_point[0] + 1,
-                                "from_params": sorted(contributing),
-                            })
-                        else:
-                            marker = "**" if c.type == "dictionary_splat" else "*"
-                            result.passes.append({
-                                "callee": name,
-                                "arg_position": None,
-                                "arg_keyword": marker,
-                                "from_params": sorted(contributing),
-                            })
-                    continue
-                # plain positional argument
-                contributing = set()
-                for aid in _identifiers(src, c):
-                    contributing |= tainted.get(aid, set())
-                if contributing:
-                    call_contributing |= contributing
-                    if vuln_class:
-                        result.sinks.append({
-                            "vuln_class": vuln_class,
-                            "callee": f"{recv}.{name}" if recv else name,
-                            "line": node.start_point[0] + 1,
-                            "from_params": sorted(contributing),
-                        })
-                    else:
-                        result.passes.append({
-                            "callee": name,
-                            "arg_position": pos,
-                            "arg_keyword": None,
-                            "from_params": sorted(contributing),
-                        })
-                pos += 1
-
-            # Conservative same-function return-flow propagation: if this call's
-            # result is captured by a plain `x = callee(...)` assignment and any
-            # argument was tainted, treat `x` as tainted from then on in THIS
-            # function too (over-approximation). Closes the common "A calls B,
-            # B returns it, A uses the return in a sink" gap without a full
-            # cross-function return-taint solver.
-            if call_contributing:
-                assigns_to = _call_lhs_assign_target(node, src)
-                if assigns_to:
-                    tainted[assigns_to] = tainted.get(assigns_to, set()) | call_contributing
-
-        elif node.type == "return_statement":
-            contributing = set()
-            for rid in _identifiers(src, node):
-                contributing |= tainted.get(rid, set())
-            for i in contributing:
-                if i not in result.returns_from_params:
-                    result.returns_from_params.append(i)
-
-    result.returns_from_params.sort()
-    return result
-
-
-# --- Java transfer-function extraction ---------------------------------
-#
-# Mirrors `analyze_function` above but walks tree-sitter-java's grammar
-# instead of tree-sitter-python's: `method_invocation` (not `call`),
-# `variable_declarator`/`assignment_expression` (not a single `assignment`
-# node type), `argument_list` (not `arguments`). Deliberately the SAME
-# scope: local identifier-aliasing taint, same-function return propagation,
-# no cross-function solver, no field/container sensitivity — a v1 port, not
-# a rewrite of the approach.
-
-_JAVA_SCOPE_STOP_TYPES = (
-    "method_declaration", "constructor_declaration", "class_declaration",
-    "interface_declaration", "enum_declaration", "lambda_expression",
-)
-
-
-def _own_scope_java(node):
-    """Yield node's descendants, but do not descend into nested
-    method/class/lambda bodies — the Java analogue of `_own_scope`."""
-    stack = list(reversed(node.children))
-    while stack:
-        cur = stack.pop()
-        yield cur
-        if cur.type not in _JAVA_SCOPE_STOP_TYPES:
-            stack.extend(reversed(cur.children))
-
-
-def _java_identifiers(src: bytes, node) -> set[str]:
-    out: set[str] = set()
-    if node.type == "identifier":
-        out.add(text(src, node))
-    for d in iter_descendants(node):
-        if d.type == "identifier":
-            out.add(text(src, d))
-    return out
-
-
-def _java_callee_parts(src: bytes, invocation_node) -> tuple[str, str]:
-    """(receiver_tail, call_name) for a `method_invocation` node.
-    `conn.execute(...)` -> ("conn", "execute"); `eval(...)` -> ("", "eval")."""
-    obj = invocation_node.child_by_field_name("object")
-    name_node = invocation_node.child_by_field_name("name")
-    recv = text(src, obj) if obj is not None else ""
-    recv_tail = recv.rsplit(".", 1)[-1] if recv else ""
-    return recv_tail, text(src, name_node) if name_node is not None else ""
-
-
-def _java_call_lhs_assign_target(call_node, src: bytes) -> str:
-    """If `call_node` is the RHS of `Type x = call(...)` (variable_declarator)
-    or `x = call(...)` (assignment_expression), return 'x'; else ''."""
-    parent = call_node.parent
-    if parent is None:
-        return ""
-    if parent.type == "variable_declarator":
-        value = parent.child_by_field_name("value")
-        name_node = parent.child_by_field_name("name")
-        if value is not None and value.id == call_node.id and name_node is not None:
-            return text(src, name_node)
-        return ""
-    if parent.type == "assignment_expression":
-        right = parent.child_by_field_name("right")
-        left = parent.child_by_field_name("left")
-        if (right is not None and right.id == call_node.id
-                and left is not None and left.type == "identifier"):
-            return text(src, left)
-        return ""
-    return ""
-
-
-def analyze_function_java(src: bytes, func_node, param_names: list[str]) -> FunctionTaint:
-    """Java analogue of `analyze_function` — same coarse, over-approximating
-    identifier-aliasing taint tracking, walking tree-sitter-java nodes."""
-    result = FunctionTaint()
-    tainted: dict[str, set[int]] = {p: {i} for i, p in enumerate(param_names) if p}
-
-    body = func_node.child_by_field_name("body")
-    if body is None:
-        return result
-
-    for node in _own_scope_java(body):
-        if node.type == "variable_declarator":
-            name_node = node.child_by_field_name("name")
-            value_node = node.child_by_field_name("value")
-            if name_node is None or value_node is None:
-                continue
-            contributing: set[int] = set()
-            for rid in _java_identifiers(src, value_node):
-                contributing |= tainted.get(rid, set())
-            if contributing:
-                lname = text(src, name_node)
-                tainted[lname] = tainted.get(lname, set()) | contributing
-
-        elif node.type == "assignment_expression":
-            left = node.child_by_field_name("left")
-            right = node.child_by_field_name("right")
-            if left is None or right is None or left.type != "identifier":
-                continue
-            contributing = set()
-            for rid in _java_identifiers(src, right):
-                contributing |= tainted.get(rid, set())
-            if contributing:
-                lname = text(src, left)
-                tainted[lname] = tainted.get(lname, set()) | contributing
-
-        elif node.type == "method_invocation":
-            name_node = node.child_by_field_name("name")
-            args_node = node.child_by_field_name("arguments")
-            if name_node is None or args_node is None:
-                continue
-            recv, name = _java_callee_parts(src, node)
-            if not name:
-                continue
-            vuln_class = classify_sink(recv, name)
-            call_contributing: set[int] = set()
-            pos = 0
-            for c in args_node.children:
-                if c.type in ("(", ")", ","):
-                    continue
-                contributing = set()
-                for aid in _java_identifiers(src, c):
-                    contributing |= tainted.get(aid, set())
-                if contributing:
-                    call_contributing |= contributing
-                    if vuln_class:
-                        result.sinks.append({
-                            "vuln_class": vuln_class,
-                            "callee": f"{recv}.{name}" if recv else name,
-                            "line": node.start_point[0] + 1,
-                            "from_params": sorted(contributing),
-                        })
-                    else:
-                        result.passes.append({
-                            "callee": name,
-                            "arg_position": pos,
-                            "arg_keyword": None,
-                            "from_params": sorted(contributing),
-                        })
-                pos += 1
-
-            # Same-function conservative return-flow propagation (see
-            # `analyze_function`'s equivalent comment for rationale).
-            if call_contributing:
-                assigns_to = _java_call_lhs_assign_target(node, src)
-                if assigns_to:
-                    tainted[assigns_to] = tainted.get(assigns_to, set()) | call_contributing
-
-        elif node.type == "return_statement":
-            contributing = set()
-            for rid in _java_identifiers(src, node):
-                contributing |= tainted.get(rid, set())
-            for i in contributing:
-                if i not in result.returns_from_params:
-                    result.returns_from_params.append(i)
-
-    result.returns_from_params.sort()
-    return result
-
-
-def run_taint_pass(root: str, repo: str, store: GraphStore, refresh: bool = False,
-                    limit: int | None = None) -> dict:
-    """Extract + write transfer facts for every Python AND Java Function node
-    in `repo`. Cached by body_hash — unchanged functions are skipped unless
-    `refresh`."""
-    rows = store.read(
-        "MATCH (n:Function {repo:$repo}) WHERE n.lang IN ['python', 'java'] "
-        "AND ($refresh OR n.taint_hash IS NULL OR n.taint_hash <> n.body_hash) "
-        "RETURN n.id AS id, n.file AS file, n.start_line AS start_line, "
-        "n.param_names AS param_names, n.body_hash AS body_hash, n.lang AS lang",
-        repo=repo, refresh=refresh,
-    )
-    if limit is not None:
-        rows = rows[:limit]
-
-    by_file: dict[str, list[dict]] = {}
-    for row in rows:
-        by_file.setdefault(row["file"], []).append(row)
-
-    files = [f for f in discover(root) if f.lang in ("python", "java") and f.relpath in by_file]
-
-    _DEF_TYPES = {
-        "python": ("function_definition",),
-        "java": ("method_declaration", "constructor_declaration"),
-    }
-
-    processed = 0
-    sink_hits = 0
-    out_rows: list[dict] = []
-    for f in files:
-        tree = get_parser(f.lang).parse(f.source)
-        def_types = _DEF_TYPES[f.lang]
-        by_line = {
-            n.start_point[0] + 1: n
-            for n in iter_descendants(tree.root_node)
-            if n.type in def_types
-        }
-        analyzer = analyze_function if f.lang == "python" else analyze_function_java
-        for row in by_file[f.relpath]:
-            func_node = by_line.get(row["start_line"])
-            if func_node is None:
-                continue
-            taint = analyzer(f.source, func_node, row.get("param_names") or [])
-            processed += 1
-            sink_hits += len(taint.sinks)
-            out_rows.append({
-                "id": row["id"],
-                "props": {
-                    "taint_json": taint.to_json(),
-                    "taint_hash": row.get("body_hash") or "",
-                    "taint_sink_count": len(taint.sinks),
-                },
-            })
-
-    if out_rows:
-        store.write_semantics(out_rows)
-    return {"files": len(files), "functions_processed": processed, "sink_hits": sink_hits}
-
 
 # --- sanitizer tagging (one cached LLM call per candidate, reads raw source) -
 
@@ -673,34 +97,34 @@ _SANITIZER_SYSTEM = (
 
 def find_sanitizer_candidates(store: GraphStore, repo: str, refresh: bool = False) -> list[dict]:
     """Candidates worth an LLM call: name hints at sanitization, or some other
-    function's transfer facts actually name this one as a callee — i.e.
-    composition would really walk through it. Language-agnostic (Python +
-    Java both populate `taint_json` via `run_taint_pass` now)."""
+    function's DFG facts actually name this one as a callee — i.e. composition
+    would really walk through it. Language-agnostic (Python + Java both populate
+    dfg_json via run_dataflow at index time now)."""
     rows = store.read(
         "MATCH (n:Function {repo:$repo}) WHERE n.lang IN ['python', 'java'] "
         "RETURN n.id AS id, n.name AS name, n.fqn AS fqn, n.signature AS signature, "
         "n.docstring AS docstring, n.file AS file, n.start_line AS start_line, "
         "n.end_line AS end_line, n.body_hash AS body_hash, "
-        "n.sanitizer_hash AS sanitizer_hash, n.taint_json AS taint_json",
+        "n.sanitizer_hash AS sanitizer_hash, n.dfg_json AS dfg_json",
         repo=repo,
     )
     callee_names: set[str] = set()
     for row in rows:
-        tj = row.get("taint_json")
-        if not tj:
+        dj = row.get("dfg_json")
+        if not dj:
             continue
         try:
-            data = json.loads(tj)
+            data = json.loads(dj)
         except (TypeError, ValueError):
             continue
-        for p in data.get("passes", []):
-            if p.get("callee"):
-                callee_names.add(p["callee"])
+        for af in data.get("passes", []):
+            if af.get("callee"):
+                callee_names.add(af["callee"])
 
     out = []
     for row in rows:
         name = row.get("name") or ""
-        if not (name in callee_names or _SANITIZER_NAME_HINTS.search(name)):
+        if not (name in callee_names or SANITIZER_HINTS.search(name)):
             continue
         body_hash = row.get("body_hash") or ""
         if not refresh and body_hash and row.get("sanitizer_hash") == body_hash:
@@ -709,21 +133,24 @@ def find_sanitizer_candidates(store: GraphStore, repo: str, refresh: bool = Fals
     return out
 
 
-def _own_sink_params(taint_json_str: str | None) -> dict[str, set[int]]:
-    """vuln_class -> set of param indices this function's OWN sinks consume.
-    Used to reject a self-contradictory sanitizer tag: a function whose body
-    IS the dangerous sink for (class, param) cannot also be "the sanitizer"
-    for that same (class, param) — sanitization has to happen upstream of the
-    sink, not be indistinguishable from it."""
-    if not taint_json_str:
+def _own_sink_params(dfg_json_str: str | None, catalog: SinkCatalog) -> dict[str, set[int]]:
+    """vuln_class -> set of param indices this function's OWN sink calls consume.
+    Used to reject self-contradictory sanitizer tags: a function whose body IS
+    the dangerous sink for (class, param) cannot also be "the sanitizer" for
+    that same (class, param)."""
+    if not dfg_json_str:
         return {}
     try:
-        data = json.loads(taint_json_str)
+        data = json.loads(dfg_json_str)
     except (TypeError, ValueError):
         return {}
     out: dict[str, set[int]] = {}
-    for s in data.get("sinks", []):
-        out.setdefault(s["vuln_class"], set()).update(s.get("from_params", []))
+    for af in data.get("passes", []):
+        if not af.get("from_params"):
+            continue
+        vuln_class = catalog.classify(af.get("recv", "") or "", af.get("callee", "") or "")
+        if vuln_class:
+            out.setdefault(vuln_class, set()).update(af["from_params"])
     return out
 
 
@@ -743,6 +170,7 @@ def _read_source(root: str, file_rel: str, start_line: int | None, end_line: int
 
 def tag_sanitizers(store: GraphStore, repo: str, root: str, llm, limit: int | None = None,
                    refresh: bool = False) -> dict:
+    catalog = load_sinks(root)
     candidates = find_sanitizer_candidates(store, repo, refresh=refresh)
     if limit is not None:
         candidates = candidates[:limit]
@@ -765,9 +193,9 @@ def tag_sanitizers(store: GraphStore, repo: str, root: str, llm, limit: int | No
         try:
             result = llm.extract(_SANITIZER_SYSTEM, user, _SANITIZER_SCHEMA)
         except Exception:
-            continue  # provider/transport failure — skip, don't fail the whole pass
+            continue
         sanitizes = result.get("sanitizes", {}) if isinstance(result, dict) else {}
-        own_sinks = _own_sink_params(row.get("taint_json"))
+        own_sinks = _own_sink_params(row.get("dfg_json"), catalog)
         sanitizes = {
             vuln_class: kept
             for vuln_class, idxs in sanitizes.items()
@@ -821,9 +249,9 @@ def _resolve_callees(node_row: dict, name: str, by_name: dict[str, list[dict]],
 
 
 def _resolve_arg_position(callee_params: list[str], arg_position, arg_keyword) -> int | None:
-    """Map a `passes` fact's arg_position/arg_keyword to the callee's actual
+    """Map a DFG ArgFlow's arg_position/arg_keyword to the callee's actual
     0-based parameter index. Returns None if it can't be precisely mapped
-    (e.g. an unmapped `*args`/`**kwargs` splat) — composition should not cross
+    (e.g. an unmapped `*args`/`**kwargs` splat) — composition does not cross
     into the callee in that case."""
     if arg_position is not None:
         return arg_position
@@ -834,20 +262,40 @@ def _resolve_arg_position(callee_params: list[str], arg_position, arg_keyword) -
     return None
 
 
-def find_taint_findings(store: GraphStore, repo: str, max_hops: int = 6) -> list[dict]:
-    """Walk transfer facts from each Endpoint-handler parameter to a sink,
-    stopping a branch early if a sanitizer covers that vuln_class on the
-    incoming param. Composition runs in Python over one bulk read (arbitrary-
-    depth JSON-fact composition isn't practical as a single Cypher query
-    without APOC) — still fully deterministic."""
+def _is_taint_source(row: dict) -> bool:
+    """A function is an external taint entry point if it handles an HTTP
+    endpoint/webhook (component_role endpoint_handler, which the role classifier
+    also assigns to controller-class methods) OR it subscribes to an event/
+    message queue (a CONSUMES_EVENT edge). Both carry attacker-influenceable
+    input from outside the process."""
+    return (row.get("component_role") == "endpoint_handler"
+            or (row.get("consumes_event") or 0) > 0)
+
+
+def find_taint_findings(store: GraphStore, repo: str, root: str = "",
+                        max_hops: int = 6) -> list[dict]:
+    """Walk DFG transfer facts from each external entry-point parameter (HTTP
+    endpoint/webhook handler or event/queue consumer) to a sink, stopping a
+    branch early if a sanitizer covers that vuln_class on the
+    incoming param. Composition runs in Python over one bulk read — still fully
+    deterministic. Sinks are classified at walk time via SinkCatalog (no re-index
+    needed when the sink list changes)."""
     rows = store.read(
         "MATCH (n:Function {repo:$repo}) "
+        "OPTIONAL MATCH (n)-[:WRITES]->(wt:Table) "
+        "OPTIONAL MATCH (n)-[:READS]->(rt:Table) "
+        "OPTIONAL MATCH (n)-[:CONSUMES_EVENT]->(ev:Event) "
+        "WITH n, collect(DISTINCT wt.name) AS writes_tables, "
+        "collect(DISTINCT rt.name) AS reads_tables, "
+        "count(DISTINCT ev) AS consumes_event "
         "RETURN n.id AS id, n.name AS name, n.fqn AS fqn, n.file AS file, "
         "n.start_line AS start_line, n.param_names AS param_names, "
-        "n.component_role AS component_role, n.taint_json AS taint_json, "
-        "n.sanitizer_json AS sanitizer_json",
+        "n.component_role AS component_role, n.dfg_json AS dfg_json, "
+        "n.sanitizer_json AS sanitizer_json, "
+        "writes_tables, reads_tables, consumes_event",
         repo=repo,
     )
+    catalog = load_sinks(root)
     by_name: dict[str, list[dict]] = {}
     for row in rows:
         by_name.setdefault(row.get("name") or "", []).append(row)
@@ -855,19 +303,25 @@ def find_taint_findings(store: GraphStore, repo: str, max_hops: int = 6) -> list
 
     findings: list[dict] = []
     seen: set[tuple] = set()
+    tainted_fields: set[str] = set()
     for row in rows:
-        if row.get("component_role") != "endpoint_handler" or not row.get("taint_json"):
+        if not _is_taint_source(row) or not row.get("dfg_json"):
             continue
         n_params = len(row.get("param_names") or [])
         for i in range(n_params):
             _walk_taint(row, i, [row.get("fqn") or row.get("name")], by_name,
-                        findings, seen, max_hops, calls_from)
+                        findings, seen, max_hops, calls_from, catalog, tainted_fields)
+    # Cross-method sweep for instance fields tainted by an entry-point param.
+    if tainted_fields:
+        _propagate_field_taint(rows, tainted_fields, by_name, findings, seen,
+                               max_hops, calls_from, catalog)
     return findings
 
 
 def enumerate_taint_paths(
     store: GraphStore,
     repo: str,
+    root: str = "",
     max_hops: int = 8,
     max_paths: int = 50000,
     include_sanitized: bool = True,
@@ -879,12 +333,20 @@ def enumerate_taint_paths(
     """
     rows = store.read(
         "MATCH (n:Function {repo:$repo}) "
+        "OPTIONAL MATCH (n)-[:WRITES]->(wt:Table) "
+        "OPTIONAL MATCH (n)-[:READS]->(rt:Table) "
+        "OPTIONAL MATCH (n)-[:CONSUMES_EVENT]->(ev:Event) "
+        "WITH n, collect(DISTINCT wt.name) AS writes_tables, "
+        "collect(DISTINCT rt.name) AS reads_tables, "
+        "count(DISTINCT ev) AS consumes_event "
         "RETURN n.id AS id, n.name AS name, n.fqn AS fqn, n.file AS file, "
         "n.start_line AS start_line, n.param_names AS param_names, "
-        "n.component_role AS component_role, n.taint_json AS taint_json, "
-        "n.sanitizer_json AS sanitizer_json",
+        "n.component_role AS component_role, n.dfg_json AS dfg_json, "
+        "n.sanitizer_json AS sanitizer_json, "
+        "writes_tables, reads_tables, consumes_event",
         repo=repo,
     )
+    catalog = load_sinks(root)
     by_name: dict[str, list[dict]] = {}
     for row in rows:
         by_name.setdefault(row.get("name") or "", []).append(row)
@@ -893,7 +355,7 @@ def enumerate_taint_paths(
     out: list[dict] = []
     seen: set[tuple] = set()
     for row in rows:
-        if row.get("component_role") != "endpoint_handler" or not row.get("taint_json"):
+        if not _is_taint_source(row) or not row.get("dfg_json"):
             continue
         params = row.get("param_names") or []
         for i, pname in enumerate(params):
@@ -910,6 +372,7 @@ def enumerate_taint_paths(
                 include_sanitized=include_sanitized,
                 max_paths=max_paths,
                 calls_from=calls_from,
+                catalog=catalog,
             )
             if len(out) >= max_paths:
                 out.sort(
@@ -945,199 +408,332 @@ def _walk_taint_paths(
     include_sanitized: bool,
     max_paths: int,
     calls_from: dict[str, set[str]],
+    catalog: SinkCatalog,
 ) -> None:
     if hops_left <= 0 or len(out) >= max_paths:
         return
-    taint_json = node_row.get("taint_json")
-    if not taint_json:
+    dfg_json = node_row.get("dfg_json")
+    if not dfg_json:
         return
     try:
-        data = json.loads(taint_json)
+        data = json.loads(dfg_json)
     except (TypeError, ValueError):
         return
 
     node_fqn = node_row.get("fqn") or node_row.get("name")
     source_fqn = source_row.get("fqn") or source_row.get("name")
 
-    for sink in data.get("sinks", []):
-        if param_idx not in sink.get("from_params", []):
+    for af in data.get("passes", []):
+        if param_idx not in af.get("from_params", []):
             continue
-        sanitized = _is_sanitized(node_row, sink["vuln_class"], param_idx)
-        if sanitized and not include_sanitized:
+        recv = af.get("recv", "") or ""
+        callee_name = af.get("callee") or ""
+        if not callee_name:
             continue
-        key = (
-            source_row.get("id"),
-            source_param_name,
-            node_row.get("id"),
-            param_idx,
-            sink["vuln_class"],
-            sink["line"],
-            tuple(chain),
-            bool(sanitized),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({
-            "source_fqn": source_fqn,
-            "source_file": source_row.get("file"),
-            "source_line": source_row.get("start_line"),
-            "source_param_index": param_idx,
-            "source_param_name": source_param_name,
-            "vuln_class": sink["vuln_class"],
-            "sink_fqn": node_fqn,
-            "sink_file": node_row.get("file"),
-            "sink_line": sink["line"],
-            "sink_callee": sink.get("callee"),
-            "path": list(chain),
-            "path_hops": max(len(chain) - 1, 0),
-            "sanitized": bool(sanitized),
-            "status": "sanitized_on_path" if sanitized else "unsanitized_reach",
-        })
-        if len(out) >= max_paths:
-            return
 
-    for p in data.get("passes", []):
-        if param_idx not in p.get("from_params", []):
-            continue
-        callee_name = p.get("callee") or ""
-        callee_rows = _resolve_callees(node_row, callee_name, by_name, calls_from)
-        if not callee_rows and callee_name and callee_name not in _TAINT_INERT_BUILTINS:
-            # No in-repo function named `callee_name` — the graph itself is
-            # the signal here (by_name has nothing for this name), so the
-            # tainted value is being handed to external/stdlib/3rd-party code
-            # we cannot trace further. Surface this explicitly instead of
-            # silently dropping the branch, since a further sink could exist
-            # inside that external call that this analysis simply can't see.
+        vuln_class = catalog.classify(recv, callee_name)
+        if vuln_class:
+            sanitized = _is_sanitized(node_row, vuln_class, param_idx)
+            if sanitized and not include_sanitized:
+                continue
+            callee_str = f"{recv}.{callee_name}" if recv else callee_name
             key = (
-                source_row.get("id"), source_param_name, node_row.get("id"),
-                param_idx, "external_unresolved", callee_name, tuple(chain),
+                source_row.get("id"),
+                source_param_name,
+                node_row.get("id"),
+                param_idx,
+                vuln_class,
+                af.get("line", 0),
+                tuple(chain),
+                bool(sanitized),
             )
-            if key not in seen:
-                seen.add(key)
-                out.append({
-                    "source_fqn": source_fqn,
-                    "source_file": source_row.get("file"),
-                    "source_line": source_row.get("start_line"),
-                    "source_param_index": param_idx,
-                    "source_param_name": source_param_name,
-                    "vuln_class": None,
-                    "sink_fqn": None,
-                    "sink_file": node_row.get("file"),
-                    "sink_line": None,
-                    "sink_callee": callee_name,
-                    "path": list(chain),
-                    "path_hops": max(len(chain) - 1, 0),
-                    "sanitized": False,
-                    "status": "external_unresolved",
-                    "external": True,
-                    "confidence": "LOW",
-                })
-        for callee_row in callee_rows:
-            callee_fqn = callee_row.get("fqn") or callee_row.get("name")
-            if callee_fqn in chain:
+            if key in seen:
                 continue
-            callee_params = callee_row.get("param_names") or []
-            resolved_pos = _resolve_arg_position(callee_params, p.get("arg_position"), p.get("arg_keyword"))
-            if resolved_pos is None or resolved_pos >= len(callee_params):
-                continue
-            _walk_taint_paths(
-                node_row=callee_row,
-                param_idx=resolved_pos,
-                source_row=source_row,
-                source_param_name=source_param_name,
-                chain=chain + [callee_fqn],
-                by_name=by_name,
-                out=out,
-                seen=seen,
-                hops_left=hops_left - 1,
-                include_sanitized=include_sanitized,
-                max_paths=max_paths,
-                calls_from=calls_from,
-            )
+            seen.add(key)
+            out.append({
+                "source_fqn": source_fqn,
+                "source_file": source_row.get("file"),
+                "source_line": source_row.get("start_line"),
+                "source_param_index": param_idx,
+                "source_param_name": source_param_name,
+                "vuln_class": vuln_class,
+                "sink_fqn": node_fqn,
+                "sink_file": node_row.get("file"),
+                "sink_line": af.get("line"),
+                "sink_callee": callee_str,
+                "path": list(chain),
+                "path_hops": max(len(chain) - 1, 0),
+                "sanitized": bool(sanitized),
+                "status": "sanitized_on_path" if sanitized else "unsanitized_reach",
+            })
             if len(out) >= max_paths:
                 return
+        else:
+            callee_rows = _resolve_callees(node_row, callee_name, by_name, calls_from)
+            if (not callee_rows and callee_name and callee_name not in TAINT_INERT_BUILTINS
+                    and recv and recv.lower() in DANGEROUS_EXTERNAL_RECEIVERS):
+                key = (
+                    source_row.get("id"), source_param_name, node_row.get("id"),
+                    param_idx, "external_unresolved", callee_name, tuple(chain),
+                )
+                if key not in seen:
+                    seen.add(key)
+                    callee_str = f"{recv}.{callee_name}" if recv else callee_name
+                    out.append({
+                        "source_fqn": source_fqn,
+                        "source_file": source_row.get("file"),
+                        "source_line": source_row.get("start_line"),
+                        "source_param_index": param_idx,
+                        "source_param_name": source_param_name,
+                        "vuln_class": None,
+                        "sink_fqn": None,
+                        "sink_file": node_row.get("file"),
+                        "sink_line": None,
+                        "sink_callee": callee_str,
+                        "path": list(chain),
+                        "path_hops": max(len(chain) - 1, 0),
+                        "sanitized": False,
+                        "status": "external_unresolved",
+                        "external": True,
+                        "confidence": "LOW",
+                    })
+            for callee_row in callee_rows:
+                callee_fqn = callee_row.get("fqn") or callee_row.get("name")
+                if callee_fqn in chain:
+                    continue
+                callee_params = callee_row.get("param_names") or []
+                resolved_pos = _resolve_arg_position(
+                    callee_params, af.get("arg_position"), af.get("arg_keyword")
+                )
+                if resolved_pos is None or resolved_pos >= len(callee_params):
+                    continue
+                _walk_taint_paths(
+                    node_row=callee_row,
+                    param_idx=resolved_pos,
+                    source_row=source_row,
+                    source_param_name=source_param_name,
+                    chain=chain + [callee_fqn],
+                    by_name=by_name,
+                    out=out,
+                    seen=seen,
+                    hops_left=hops_left - 1,
+                    include_sanitized=include_sanitized,
+                    max_paths=max_paths,
+                    calls_from=calls_from,
+                    catalog=catalog,
+                )
+                if len(out) >= max_paths:
+                    return
 
 
-def _walk_taint(node_row: dict, param_idx: int, path: list[str], by_name: dict[str, list[dict]],
-                 findings: list[dict], seen: set[tuple], hops_left: int,
-                 calls_from: dict[str, set[str]]) -> None:
+def _walk_taint(node_row: dict, param_idx: int, path: list[str],
+                by_name: dict[str, list[dict]],
+                findings: list[dict], seen: set[tuple], hops_left: int,
+                calls_from: dict[str, set[str]], catalog: SinkCatalog,
+                tainted_fields: set[str] | None = None) -> None:
     if hops_left <= 0:
         return
-    taint_json = node_row.get("taint_json")
-    if not taint_json:
+    dfg_json = node_row.get("dfg_json")
+    if not dfg_json:
         return
     try:
-        data = json.loads(taint_json)
+        data = json.loads(dfg_json)
     except (TypeError, ValueError):
         return
 
-    for sink in data.get("sinks", []):
-        if param_idx not in sink.get("from_params", []):
-            continue
-        if _is_sanitized(node_row, sink["vuln_class"], param_idx):
-            continue
-        key = (node_row["id"], sink["vuln_class"], sink["line"], tuple(path))
-        if key in seen:
-            continue
-        seen.add(key)
-        findings.append({
-            "category": "security",
-            "subcategory": sink["vuln_class"],
-            "source": "graph_proven",
-            "owning_fqn": node_row.get("fqn") or node_row.get("name"),
-            "file": node_row.get("file"),
-            "line": sink["line"],
-            "message": (
-                f"{sink['vuln_class']}: untrusted input reaches {sink['callee']} "
-                f"via {' -> '.join(path)}"
-            ),
-            "path": list(path),   # full source->sink fqn chain — used by the qualify pass
-        })
+    # Field-taint seed: if the tainted param is stored to self.<field>, that
+    # (class-qualified) field becomes tainted for the cross-method sweep that
+    # runs after the param walk. Names match ArgFlow.from_fields exactly.
+    if tainted_fields is not None:
+        for fw in data.get("field_writes", []):
+            if param_idx in (fw.get("from_params") or []):
+                fld = fw.get("field")
+                if fld:
+                    tainted_fields.add(fld)
 
-    for p in data.get("passes", []):
-        if param_idx not in p.get("from_params", []):
+    for af in data.get("passes", []):
+        if param_idx not in af.get("from_params", []):
             continue
-        callee_name = p.get("callee") or ""
-        callee_rows = _resolve_callees(node_row, callee_name, by_name, calls_from)
-        if not callee_rows and callee_name and callee_name not in _TAINT_INERT_BUILTINS:
-            # Graph-derived signal: `by_name` (built from all in-repo Function
-            # nodes) has nothing under this name, so this is a call to
-            # external/stdlib/3rd-party code — the walk truncates here, but
-            # unlike a plain silent drop, we record that it was an external
-            # continuation (not a dead end from lack of data) so Agent B's
-            # qualify pass and Agent A's taint-flags rendering can say
-            # "reaches `X` (external)" instead of the chain just trailing off.
-            key = (node_row["id"], "external_unresolved", callee_name, tuple(path))
-            if key not in seen:
-                seen.add(key)
-                findings.append({
-                    "category": "security",
-                    "subcategory": "unresolved_external_taint_flow",
-                    "source": "graph_proven",
-                    "owning_fqn": node_row.get("fqn") or node_row.get("name"),
-                    "file": node_row.get("file"),
-                    "line": node_row.get("start_line"),
-                    "message": (
-                        f"tainted value reaches external call {callee_name} "
-                        f"via {' -> '.join(path)} — cannot trace further since "
-                        f"{callee_name} isn't defined in this repo (may itself "
-                        "reach a sink internally)."
-                    ),
-                    "path": list(path),
-                    "external": True,
-                    "confidence": "LOW",
-                })
-        for callee_row in callee_rows:
-            callee_fqn = callee_row.get("fqn") or callee_row.get("name")
-            if callee_fqn in path:
-                continue  # recursion/cycle guard
-            callee_params = callee_row.get("param_names") or []
-            resolved_pos = _resolve_arg_position(callee_params, p.get("arg_position"), p.get("arg_keyword"))
-            if resolved_pos is None or resolved_pos >= len(callee_params):
+        recv = af.get("recv", "") or ""
+        callee_name = af.get("callee") or ""
+        if not callee_name:
+            continue
+
+        vuln_class = catalog.classify(recv, callee_name)
+        if vuln_class:
+            if _is_sanitized(node_row, vuln_class, param_idx):
                 continue
-            _walk_taint(callee_row, resolved_pos, path + [callee_fqn], by_name,
-                        findings, seen, hops_left - 1, calls_from)
+            key = (node_row["id"], vuln_class, af.get("line", 0), tuple(path))
+            if key in seen:
+                continue
+            seen.add(key)
+            callee_str = f"{recv}.{callee_name}" if recv else callee_name
+            # Enrich SQL findings with affected table names when the graph knows them.
+            tables = [t for t in (node_row.get("writes_tables") or []) if t]
+            table_suffix = f" [tables: {', '.join(sorted(tables))}]" if (tables and vuln_class in ("sql_injection", "nosql_injection")) else ""
+            findings.append({
+                "category": "security",
+                "subcategory": vuln_class,
+                "source": "graph_proven",
+                "owning_fqn": node_row.get("fqn") or node_row.get("name"),
+                "file": node_row.get("file"),
+                "line": af.get("line") or node_row.get("start_line") or 0,
+                "message": (
+                    f"{vuln_class}: untrusted input reaches {callee_str} "
+                    f"via {' -> '.join(path)}{table_suffix}"
+                ),
+                "path": list(path),
+                **({"tables": tables} if tables else {}),
+            })
+        else:
+            callee_rows = _resolve_callees(node_row, callee_name, by_name, calls_from)
+            if (not callee_rows and callee_name and callee_name not in TAINT_INERT_BUILTINS
+                    and recv and recv.lower() in DANGEROUS_EXTERNAL_RECEIVERS):
+                key = (node_row["id"], "external_unresolved", callee_name, tuple(path))
+                if key not in seen:
+                    seen.add(key)
+                    callee_str = f"{recv}.{callee_name}" if recv else callee_name
+                    findings.append({
+                        "category": "security",
+                        "subcategory": "unresolved_external_taint_flow",
+                        "source": "graph_proven",
+                        "owning_fqn": node_row.get("fqn") or node_row.get("name"),
+                        "file": node_row.get("file"),
+                        "line": node_row.get("start_line"),
+                        "message": (
+                            f"tainted value reaches {callee_str} "
+                            f"via {' -> '.join(path)} — cannot trace further into "
+                            f"this external library (may reach a sink internally)."
+                        ),
+                        "path": list(path),
+                        "external": True,
+                        "confidence": "LOW",
+                    })
+            for callee_row in callee_rows:
+                callee_fqn = callee_row.get("fqn") or callee_row.get("name")
+                if callee_fqn in path:
+                    continue
+
+                # Graph-proven sink: callee function has WRITES edges to SQL
+                # tables (derived at index time by _derive_sql_links). Catches
+                # ORM methods that aren't in the name-based SinkCatalog.
+                callee_tables = [t for t in (callee_row.get("writes_tables") or []) if t]
+                if callee_tables:
+                    if not _is_sanitized(node_row, "sql_injection", param_idx):
+                        key = (node_row["id"], "sql_injection", af.get("line", 0), tuple(path))
+                        if key not in seen:
+                            seen.add(key)
+                            tables_str = ", ".join(sorted(callee_tables))
+                            callee_str = f"{recv}.{callee_name}" if recv else callee_name
+                            findings.append({
+                                "category": "security",
+                                "subcategory": "sql_injection",
+                                "source": "graph_proven",
+                                "owning_fqn": node_row.get("fqn") or node_row.get("name"),
+                                "file": node_row.get("file"),
+                                "line": af.get("line") or node_row.get("start_line") or 0,
+                                "message": (
+                                    f"sql_injection: untrusted input reaches {callee_str} "
+                                    f"which writes to table(s) [{tables_str}] "
+                                    f"via {' -> '.join(path)}"
+                                ),
+                                "path": list(path),
+                                "tables": callee_tables,
+                            })
+                    continue
+
+                callee_params = callee_row.get("param_names") or []
+                resolved_pos = _resolve_arg_position(
+                    callee_params, af.get("arg_position"), af.get("arg_keyword")
+                )
+                if resolved_pos is None or resolved_pos >= len(callee_params):
+                    continue
+                _walk_taint(callee_row, resolved_pos, path + [callee_fqn], by_name,
+                            findings, seen, hops_left - 1, calls_from, catalog,
+                            tainted_fields)
+
+
+def _propagate_field_taint(rows: list[dict], tainted_fields: set[str],
+                           by_name: dict[str, list[dict]],
+                           findings: list[dict], seen: set[tuple], max_hops: int,
+                           calls_from: dict[str, set[str]], catalog: SinkCatalog) -> None:
+    """Second, cross-method sweep after the param walk. A field tainted by an
+    entry-point param (self.x = param in one method) reaching a sink through a
+    DIFFERENT method (conn.execute(self.x)) is invisible to the param walk,
+    which only follows call arguments. Here we fix-point over the tainted-field
+    set: any method whose ArgFlow reads a tainted field into a sink is a finding;
+    a method that stores a tainted field into another self.field grows the set;
+    a tainted field passed as a call argument re-enters the param walk on the
+    callee. Field names are class-qualified, so matches never cross classes."""
+    # Fixed point: keep sweeping until no new field becomes tainted.
+    changed = True
+    guard = 0
+    while changed and guard < 50:
+        guard += 1
+        changed = False
+        for row in rows:
+            dfg = row.get("dfg_json")
+            if not dfg:
+                continue
+            try:
+                data = json.loads(dfg)
+            except (TypeError, ValueError):
+                continue
+            method_fqn = row.get("fqn") or row.get("name")
+
+            for af in data.get("passes", []):
+                hit_fields = set(af.get("from_fields") or []) & tainted_fields
+                if not hit_fields:
+                    continue
+                recv = af.get("recv", "") or ""
+                callee_name = af.get("callee") or ""
+                if not callee_name:
+                    continue
+                vuln_class = catalog.classify(recv, callee_name)
+                if vuln_class:
+                    key = (row["id"], vuln_class, af.get("line", 0), "field")
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    callee_str = f"{recv}.{callee_name}" if recv else callee_name
+                    fld = sorted(hit_fields)[0]
+                    findings.append({
+                        "category": "security",
+                        "subcategory": vuln_class,
+                        "source": "graph_proven",
+                        "owning_fqn": method_fqn,
+                        "file": row.get("file"),
+                        "line": af.get("line") or row.get("start_line") or 0,
+                        "message": (
+                            f"{vuln_class}: tainted instance field `{fld}` (set from "
+                            f"untrusted input in another method) reaches {callee_str} "
+                            f"in {method_fqn}"
+                        ),
+                        "path": [method_fqn],
+                        "via_field": fld,
+                    })
+                else:
+                    # Tainted field passed into a helper — re-enter the param walk.
+                    callee_rows = _resolve_callees(row, callee_name, by_name, calls_from)
+                    for callee_row in callee_rows:
+                        callee_params = callee_row.get("param_names") or []
+                        resolved_pos = _resolve_arg_position(
+                            callee_params, af.get("arg_position"), af.get("arg_keyword")
+                        )
+                        if resolved_pos is None or resolved_pos >= len(callee_params):
+                            continue
+                        _walk_taint(callee_row, resolved_pos,
+                                    [method_fqn, callee_row.get("fqn") or callee_row.get("name")],
+                                    by_name, findings, seen, max_hops - 1,
+                                    calls_from, catalog, tainted_fields)
+
+            # field -> field: storing a tainted field into another self.field.
+            for fw in data.get("field_writes", []):
+                if set(fw.get("from_fields") or []) & tainted_fields:
+                    fld = fw.get("field")
+                    if fld and fld not in tainted_fields:
+                        tainted_fields.add(fld)
+                        changed = True
 
 
 def _is_sanitized(node_row: dict, vuln_class: str, param_idx: int) -> bool:
@@ -1192,7 +788,8 @@ _QUALIFY_SYSTEM = (
 )
 
 
-def _chain_source_blocks(root: str, fqns: list[str], by_fqn: dict, store: GraphStore | None = None) -> list[str]:
+def _chain_source_blocks(root: str, fqns: list[str], by_fqn: dict,
+                          store: GraphStore | None = None) -> list[str]:
     """Read the raw source of every function in `fqns`, in chain order —
     plus, no matter what, that function's file imports and any real
     class/module-level shared state it reads/writes, since a sanitizer/guard
@@ -1239,7 +836,7 @@ def qualify_taint_finding(store: GraphStore, repo: str, root: str, llm,
         return None
     verdict = result.get("verdict")
     if verdict != "true_positive":
-        return None   # false_positive or needs_more_context -> nothing to report here
+        return None
 
     confidence = str(result.get("confidence", "MEDIUM")).upper()
     message = str(result.get("message") or finding.get("message") or "").strip()
@@ -1265,11 +862,7 @@ def run_taint_qualify(store: GraphStore, repo: str, root: str, llm,
     each finding by reading the chain's raw source. Only LLM-confirmed
     true_positive findings are returned — a precision filter layered on top
     of `find_taint_findings`'s recall, not a replacement for it."""
-    raw_findings = find_taint_findings(store, repo, max_hops=max_hops)
-    # `external_unresolved` entries aren't confirmed sink-reaches to verify
-    # sanitization on (there's no sink to check) — they're a coverage-gap
-    # signal, already surfaced separately at LOW confidence by the caller
-    # (cli.py's stage1) directly from `find_taint_findings`'s raw output.
+    raw_findings = find_taint_findings(store, repo, root=root, max_hops=max_hops)
     raw_findings = [f for f in raw_findings if not f.get("external")]
     if limit is not None:
         raw_findings = raw_findings[:limit]
@@ -1285,6 +878,175 @@ def run_taint_qualify(store: GraphStore, repo: str, root: str, llm,
         f = qualify_taint_finding(store, repo, root, llm, finding, by_fqn)
         if f is not None:
             out.append(f)
+    return out
+
+
+# --- Agent B: free-form security DISCOVERY (reads reachable chains) ---------
+#
+# Distinct from run_taint_qualify (which only CONFIRMS a specific deterministic
+# finding under its pre-decided class). This reviewer reads the full raw source
+# of a reachable endpoint->sink chain and reports ANY security vulnerability it
+# can prove — no fixed vuln vocabulary. The deterministic taint findings for the
+# chain are handed in as HIGH-confidence EVIDENCE to anchor precision, not as the
+# only thing it may report. Per the confirmed 2026 redesign: "discovery + evidence".
+
+_SECURITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "owning_fqn": {
+                        "type": "string",
+                        "description": "the function in the chain where the vulnerability lives (exact fqn as shown)",
+                    },
+                    "subcategory": {
+                        "type": "string",
+                        "description": (
+                            "concise snake_case name of the SPECIFIC vulnerability, e.g. "
+                            "sql_injection, path_traversal, ssrf, insecure_deserialization, "
+                            "missing_authorization, broken_object_level_authorization, "
+                            "server_side_template_injection. Pick the most precise name — "
+                            "do NOT force it into a preset list."
+                        ),
+                    },
+                    "line": {"type": "integer"},
+                    "message": {"type": "string"},
+                    "evidence": {"type": "string", "description": "quote the actual vulnerable code"},
+                    "recommendation": {"type": "string"},
+                    "severity": {
+                        "type": "number",
+                        "description": "how bad IF real, 0-10 (ignore reachability — scoring adds that)",
+                    },
+                    "confidence": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
+                },
+                "required": ["owning_fqn", "subcategory", "line", "message", "evidence", "severity", "confidence"],
+            },
+        }
+    },
+    "required": ["findings"],
+}
+
+_SECURITY_SYSTEM = (
+    "You are a senior application-security engineer reviewing a REACHABLE call chain in a "
+    "codebase — a sequence of functions from an external entry point (endpoint/webhook/queue "
+    "handler) down through the code it calls. You are given the RAW SOURCE of every function "
+    "in the chain, in order, plus its imports and any real shared state.\n\n"
+    "Find EVERY security vulnerability you can prove from this source — do not limit yourself "
+    "to any preset list of vulnerability types, and name each one with the most precise "
+    "snake_case subcategory you can (e.g. sql_injection, path_traversal, ssrf, "
+    "insecure_deserialization, xxe, open_redirect, server_side_template_injection, "
+    "missing_authorization, broken_object_level_authorization, hardcoded_secret, weak_crypto, "
+    "sensitive_data_exposure, mass_assignment — or a better name if none of these fit).\n\n"
+    "EVIDENCE: some flows in this chain were already proven by static taint analysis "
+    "(tree-sitter DFG) to carry untrusted input into a sink with no sanitizer detected. Those "
+    "are listed as GRAPH-PROVEN EVIDENCE below. Treat them as high-confidence starting points: "
+    "confirm and sharpen them (they are real unless the source shows a sanitizer/validator/"
+    "parameterization the static pass missed), AND look beyond them for additional issues the "
+    "static pass could not classify — an uncatalogued/ORM/framework sink, a missing "
+    "authorization check before a sensitive operation, an object reference taken straight from "
+    "user input, unsafe deserialization, etc.\n\n"
+    "Judge from the SOURCE, not from names: a value passed straight through (f-string, "
+    "concat, direct forwarding) into a dangerous operation with no visible "
+    "validation/escaping/parameterization is a real finding — absence of a safeguard IS the "
+    "signal. If the code explicitly sanitizes/validates/parameterizes before the dangerous "
+    "use, do NOT report it.\n\n"
+    "SEVERITY: set `severity` 0-10 = how bad IF real, from the vuln class alone (RCE/SQLi/"
+    "deserialization ~9, path traversal/SSRF ~7, missing authz ~8, info leak ~5). Ignore "
+    "reachability — the scorer multiplies blast radius in afterward.\n\n"
+    "For each finding set `owning_fqn` to the exact function in the chain where the bug lives, "
+    "`line` to the vulnerable line, and quote the code in `evidence`. Report each distinct "
+    "issue ONCE (not once per function it passes through). If the chain has no provable "
+    "security issue, return an EMPTY findings array — do not invent findings."
+)
+
+
+def review_chain_security(store: GraphStore, repo: str, root: str, llm,
+                          fqns: list[str], by_fqn: dict,
+                          evidence: list[dict]) -> list[Finding]:
+    """Read the whole chain's raw source + deterministic evidence and return
+    free-form security Findings (any vuln class, LLM-assigned severity)."""
+    if llm is None or not fqns:
+        return []
+    chain_lines = _chain_source_blocks(root, fqns, by_fqn, store=store)
+
+    if evidence:
+        ev_lines = "\n".join(
+            f"- [{e.get('subcategory')}] sink at {e.get('owning_fqn')} "
+            f"({e.get('file')}:{e.get('line')}): {e.get('message')}"
+            for e in evidence
+        )
+        ev_block = f"GRAPH-PROVEN EVIDENCE (static taint, high confidence):\n{ev_lines}\n\n"
+    else:
+        ev_block = "GRAPH-PROVEN EVIDENCE: none for this chain — review it fresh.\n\n"
+
+    user = (
+        f"reachable chain (entry -> ... -> deepest callee): {' -> '.join(fqns)}\n\n"
+        + ev_block
+        + "chain source (in order), raw code:\n" + "\n\n".join(chain_lines)
+    )
+    result = llm.extract(_SECURITY_SYSTEM, user, _SECURITY_SCHEMA)
+    items = result.get("findings", []) if isinstance(result, dict) else []
+    out: list[Finding] = []
+    for item in items:
+        owning_fqn = str(item.get("owning_fqn") or fqns[-1])
+        row = by_fqn.get(owning_fqn, {})
+        f = Finding.from_dict(item, category="security", source="llm_judged",
+                              owning_fqn=owning_fqn, file=row.get("file", ""))
+        if f:
+            if not f.line:
+                f.line = row.get("start_line") or 0
+            out.append(f)
+    return out
+
+
+def run_agent_b_security(store: GraphStore, repo: str, root: str, llm,
+                         max_hops: int = 6, limit: int | None = None) -> list[Finding]:
+    """Free-form security discovery over every reachable endpoint->sink chain.
+
+    Enumerates the reachable attack surface (endpoint/webhook/queue-rooted chains
+    that reach a sink, sanitized or not), dedups to unique function-chains, and
+    hands each chain's full source + its deterministic taint findings (as
+    evidence) to the LLM, which reports ANY provable vulnerability. Replaces the
+    old confirm-only qualify pass; the deterministic findings still flow through
+    separately as graph_proven, so this is additive recall, not a filter."""
+    if llm is None:
+        return []
+
+    det = find_taint_findings(store, repo, root=root, max_hops=max_hops)
+    evidence_by_chain: dict[tuple, list[dict]] = defaultdict(list)
+    for f in det:
+        if f.get("external"):
+            continue
+        key = tuple(f.get("path") or [f.get("owning_fqn")])
+        evidence_by_chain[key].append(f)
+
+    # Reachable chains (unique fqn tuples) from endpoint enumeration, including
+    # sanitized ones — a chain the static pass thinks is clean can still hide a
+    # vuln class the catalog doesn't model.
+    paths = enumerate_taint_paths(store, repo, root=root, max_hops=max_hops,
+                                  include_sanitized=True)
+    chains: dict[tuple, list[str]] = {}
+    for p in paths:
+        fqns = p.get("path") or []
+        if fqns:
+            chains[tuple(fqns)] = fqns
+    for key in evidence_by_chain:
+        chains.setdefault(key, list(key))
+
+    # Longer chains first (more surface, more likely to hide cross-function bugs).
+    chain_list = sorted(chains.values(), key=len, reverse=True)
+    if limit is not None:
+        chain_list = chain_list[:limit]
+
+    by_fqn = _all_functions_by_fqn(store, repo)
+
+    out: list[Finding] = []
+    for fqns in chain_list:
+        evidence = evidence_by_chain.get(tuple(fqns), [])
+        out.extend(review_chain_security(store, repo, root, llm, fqns, by_fqn, evidence))
     return out
 
 
@@ -1309,6 +1071,10 @@ def run_taint_qualify(store: GraphStore, repo: str, root: str, llm,
 # that catches cycles invisible to endpoint-rooted walks (no controller/route
 # ever calls into them).
 
+# Agent C's classification is FREE-FORM (no enforced enum). These names remain
+# only as illustrative examples surfaced in the Stage-2 prompt/schema and as the
+# subcategories the deterministic cycle/depth sweep emits directly; they are NOT
+# a whitelist. SEVERITY_BASE covers the known ones for the graph_proven path.
 _DESIGN_SUBCATS = [
     "layering_violation", "missing_authorization",
     "circular_architectural_dependency", "unclear_ownership",
@@ -1317,8 +1083,8 @@ _DESIGN_SUBCATS = [
 MAX_DEPTH = 8
 MAX_EXAMPLES_PER_SHAPE = 3
 MAX_SHAPES_TO_LLM = 60
-_FANOUT_CAP = 12          # children considered per node during the walk
-_MAX_WALK_STEPS = 20000   # global budget across all roots, guards pathological repos
+_FANOUT_CAP = 12
+_MAX_WALK_STEPS = 20000
 
 CYCLE_MARK = "<cycle>"
 DEEP_MARK = "<max_depth>"
@@ -1373,7 +1139,6 @@ def collect_path_shapes(store: GraphStore, repo: str, max_depth: int = MAX_DEPTH
 
     shapes: dict[tuple, dict] = {}
     steps_used = 0
-    # Explicit stack: (node_id, roles_path, fqn_path, visited_set)
     stack = [(r, [], [], frozenset({r})) for r in roots]
 
     while stack and steps_used < _MAX_WALK_STEPS:
@@ -1432,19 +1197,16 @@ _STAGE1_SYSTEM = (
     "the repo's evident convention — only flag genuine deviations. "
     "IMPORTANT: role labels are produced by a heuristic classifier (name suffix, package path, "
     "or framework annotations), not verified ground truth — each role in a chain example is shown "
-    "with a confidence (HIGH/MEDIUM/LOW). A `helper`/`unknown` role, or any MEDIUM/LOW-confidence "
+    "with a confidence (HIGH/MEDIUM/LOW). An `unknown`/unlabeled role, or any MEDIUM/LOW-confidence "
     "role, is very often just an ordinary function the classifier couldn't confidently label (e.g. "
-    "a module-level utility function) — never flag a shape as risky ONLY because it contains a "
-    "helper/unclear-role step; that alone is not a layering violation. Only flag it if there is a "
+    "a module-level utility function) — never flag a shape as risky ONLY because it contains an "
+    "unknown/unclear-role step; that alone is not a layering violation. Only flag it if there is a "
     "HIGH-confidence role actually being skipped or contradicted (e.g. a HIGH-confidence controller "
     "calling a HIGH-confidence repository with no service anywhere in between)."
 )
 
 
 def _short_desc(row: dict) -> str:
-    """First line of a function's docstring, truncated — cheap identity/intent
-    context for the LLM (a graph field read, no extra LLM call). Stage 2's
-    deep-dive reads full raw source instead, only for flagged shapes."""
     doc = (row.get("docstring") or "").strip()
     if not doc:
         return ""
@@ -1453,9 +1215,6 @@ def _short_desc(row: dict) -> str:
 
 
 def _describe_chain(fqns: list[str], by_fqn: dict) -> str:
-    """Render one example chain as `fqn (desc, role_confidence)` hops, so
-    Stage 1 sees real function identity/intent AND how much to trust each
-    role label, not just an anonymous role sequence."""
     parts = []
     for fqn in fqns:
         row = by_fqn.get(fqn, {})
@@ -1466,7 +1225,8 @@ def _describe_chain(fqns: list[str], by_fqn: dict) -> str:
     return " -> ".join(parts)
 
 
-def flag_risky_shapes(shapes: dict, llm, by_fqn: dict | None = None, limit: int | None = None) -> set:
+def flag_risky_shapes(shapes: dict, llm, by_fqn: dict | None = None,
+                       limit: int | None = None) -> set:
     """Stage 1: one batched LLM call. Returns the set of risky shape KEYS
     (tuples). Returns an empty set if there are no shapes or no llm.
 
@@ -1483,7 +1243,7 @@ def flag_risky_shapes(shapes: dict, llm, by_fqn: dict | None = None, limit: int 
     if len(ranked) <= cap:
         items = ranked
     else:
-        tail_budget = max(1, cap // 5)   # reserve ~20% of the budget for the long tail
+        tail_budget = max(1, cap // 5)
         head_budget = cap - tail_budget
         head = ranked[:head_budget]
         tail = ranked[-tail_budget:]
@@ -1498,7 +1258,9 @@ def flag_risky_shapes(shapes: dict, llm, by_fqn: dict | None = None, limit: int 
         examples = entry["examples"][:2] if entry.get("examples") else []
         example_strs = [_describe_chain(ex, by_fqn) for ex in examples]
         examples_text = "; ".join(example_strs)
-        lines.append(f"{sid}: roles=[{' -> '.join(entry['roles'])}] count={entry['count']} examples={examples_text}")
+        lines.append(
+            f"{sid}: roles=[{' -> '.join(entry['roles'])}] count={entry['count']} examples={examples_text}"
+        )
     user = "shape catalogue:\n" + "\n".join(lines)
     result = llm.extract(_STAGE1_SYSTEM, user, _STAGE1_SCHEMA)
     risky_ids = result.get("risky_shape_ids", []) if isinstance(result, dict) else []
@@ -1513,7 +1275,16 @@ _STAGE2_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "subcategory": {"type": "string", "enum": _DESIGN_SUBCATS},
+                    "subcategory": {
+                        "type": "string",
+                        "description": (
+                            "concise snake_case name of the architectural/design problem, e.g. "
+                            "layering_violation, missing_authorization, "
+                            "circular_architectural_dependency, unclear_ownership, "
+                            "god_function, leaky_abstraction, missing_validation_layer. "
+                            "Pick the most precise name — do NOT force it into a preset list."
+                        ),
+                    },
                     "owning_fqn": {
                         "type": "string",
                         "description": "which function in the given chain this finding is anchored to",
@@ -1521,9 +1292,13 @@ _STAGE2_SCHEMA = {
                     "message": {"type": "string"},
                     "evidence": {"type": "string"},
                     "recommendation": {"type": "string"},
+                    "severity": {
+                        "type": "number",
+                        "description": "how bad IF real, 0-10 (ignore reachability — scoring adds that)",
+                    },
                     "confidence": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
                 },
-                "required": ["subcategory", "owning_fqn", "message"],
+                "required": ["subcategory", "owning_fqn", "message", "severity"],
             },
         }
     },
@@ -1531,29 +1306,33 @@ _STAGE2_SCHEMA = {
 }
 
 _STAGE2_SYSTEM = (
-    "You are doing a deep architectural review of ONE specific call chain. You are given the RAW "
-    "SOURCE of every function in the chain, in order, each labeled with its role and role-"
-    "confidence. Decide whether this chain has a real architecture or security problem: a skipped/"
-    "backwards layer, a chain that's too deep or convoluted to maintain, a role repeating in a way "
-    "that suggests missing abstraction, or (if the chain reaches something sensitive like raw SQL/"
-    "shell/filesystem) a missing validation/authorization layer given the roles shown. Anchor every "
-    "finding to the single function in the chain most responsible for it, in `owning_fqn`. Do not "
-    "invent behavior not shown in the given source. "
+    "You are Agent C — a software architect doing a deep review of ONE specific call chain. You "
+    "are given the RAW SOURCE of every function in the chain, in order, each labeled with its role "
+    "and role-confidence. Decide whether this chain has a real architecture or design problem: a "
+    "skipped/backwards layer, a chain too deep or convoluted to maintain, a role repeating in a way "
+    "that suggests missing abstraction, a god-function doing too much, a leaky abstraction, or (if "
+    "the chain reaches something sensitive like raw SQL/shell/filesystem) a missing "
+    "validation/authorization layer given the roles shown.\n\n"
+    "Classification is FREE-FORM — name each finding with the most precise concise snake_case "
+    "subcategory you can; do NOT force it into a preset list. Anchor every finding to the single "
+    "function in the chain most responsible for it, in `owning_fqn`. Set `severity` 0-10 = how bad "
+    "the design problem is if real (a missing authz layer on a sensitive op ~8, a cosmetic layering "
+    "skip ~2). Do not invent behavior not shown in the given source.\n\n"
     "IMPORTANT: role labels come from a heuristic classifier, not verified ground truth — treat "
-    "MEDIUM/LOW-confidence roles and `helper`/`unknown` roles as uncertain, not as proof of a "
-    "layering problem; a `helper` step with no security-sensitive action in its source is not itself "
-    "an authorization or layering issue. If a function's role is simply unclear and nothing else "
-    "is wrong, use `unclear_ownership` (LOW confidence) rather than forcing it into "
-    "`missing_authorization` — do not claim a missing authorization check unless the code actually "
-    "shows a sensitive operation (data mutation, deletion, raw SQL/shell/filesystem access) with no "
-    "visible auth/validation step anywhere in the chain. If this chain has no real problem, return "
-    "an EMPTY findings array — do not invent a finding just to say something, and do not report the "
-    "same underlying issue more than once across different functions in the chain."
+    "MEDIUM/LOW-confidence roles and `unknown`/unlabeled roles as uncertain, not as proof of a "
+    "layering problem; an unlabeled step with no security-sensitive action in its source is not "
+    "itself an authorization or layering issue. If a function's role is simply unclear and nothing "
+    "else is wrong, use `unclear_ownership` (LOW confidence, low severity) rather than forcing it "
+    "into `missing_authorization` — do not claim a missing authorization check unless the code "
+    "actually shows a sensitive operation (data mutation, deletion, raw SQL/shell/filesystem "
+    "access) with no visible auth/validation step anywhere in the chain. If this chain has no real "
+    "problem, return an EMPTY findings array — do not invent a finding just to say something, and "
+    "do not report the same underlying issue more than once across different functions in the chain."
 )
 
 
 def _analyze_shape_instance(store: GraphStore, by_fqn: dict, root: str, shape_key: tuple,
-                            fqns: list, llm) -> list[Finding]:
+                             fqns: list, llm) -> list[Finding]:
     """Deep-dive ONE concrete chain instance of a flagged shape by reading the
     raw source of every function in it. Split out of `analyze_shape` so every
     example instance of a shape gets its own LLM call, not just the first."""
@@ -1624,7 +1403,7 @@ def find_unreached_cycles(store: GraphStore, repo: str) -> list[Finding]:
     budget."""
     nodes = _all_functions(store, repo)
     adj = _adjacency(store, repo)
-    color: dict[str, int] = {}  # 0=unvisited (absent), 1=in-progress, 2=done
+    color: dict[str, int] = {}
     path: list[str] = []
     on_path: set[str] = set()
     seen_keys: set[tuple] = set()
@@ -1672,7 +1451,7 @@ def find_unreached_cycles(store: GraphStore, repo: str) -> list[Finding]:
             if color.get(nid, 0) == 0:
                 dfs(nid)
     except RecursionError:
-        pass  # best-effort on pathologically deep/wide graphs; partial results kept
+        pass
 
     return findings
 
@@ -1735,17 +1514,25 @@ def run_architecture_pass(store: GraphStore, repo: str, root: str, llm=None,
 
 def run_agent_b(store: GraphStore, repo: str, root: str, llm,
                 max_hops: int = 6, qualify_limit: int | None = None,
-                shape_limit: int | None = None, tag_limit: int | None = None) -> dict:
-    """Single entry point running all of Agent B's passes in order: taint
-    tagging, deterministic composition, LLM qualify (raw-source chains), and
-    architecture/layering (shape catalogue + raw-source deep-dive + whole-
-    graph cycle sweep)."""
-    tag_stats = run_taint_pass(root, repo, store, limit=tag_limit)
-    det_findings = find_taint_findings(store, repo, max_hops=max_hops)
-    qualified = run_taint_qualify(store, repo, root, llm, max_hops=max_hops, limit=qualify_limit) if llm else []
+                shape_limit: int | None = None) -> dict:
+    """Single entry point running all of Agent B's passes in order:
+    sanitizer tagging (LLM, cached by body_hash), deterministic DFG-based
+    taint composition, LLM qualify (raw-source chains), and
+    architecture/layering (shape catalogue + raw-source deep-dive +
+    whole-graph cycle sweep).
+
+    Sanitizer tagging runs first so the deterministic walk can stop at
+    sanitized nodes. Results are cached by body_hash — only changed
+    functions cost an LLM call on subsequent runs."""
+    if llm is not None:
+        tag_sanitizers(store, repo, root, llm)
+    det_findings = find_taint_findings(store, repo, root=root, max_hops=max_hops)
+    # Free-form security discovery over reachable chains, with the deterministic
+    # findings handed in as evidence (replaces the old confirm-only qualify).
+    qualified = run_agent_b_security(store, repo, root, llm, max_hops=max_hops,
+                                     limit=qualify_limit) if llm else []
     arch = run_architecture_pass(store, repo, root, llm, shape_limit=shape_limit)
     return {
-        "tag_stats": tag_stats,
         "det_findings": det_findings,
         "qualified": qualified,
         "arch_findings": arch["findings"],

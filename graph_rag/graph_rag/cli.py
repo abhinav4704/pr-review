@@ -19,7 +19,8 @@ import sys
 from .graph_core.config import neo4j_config
 from .graph_core.pipeline import index_repo
 from .graph_core.store import GraphStore
-from .graph_core.findings import Finding, dedupe, collapse_cross_category_duplicates
+from .graph_core.findings import Finding
+from .analyzer.dedup import dedupe_findings
 from .graph_core.llm import DEFAULT_PROVIDER, PROVIDERS, SemanticLLM, default_model
 
 from .analyzer import agents as agents_mod
@@ -106,11 +107,18 @@ def _cmd_analyze(args) -> int:
     try:
         print(f"\n  repo: {repo}")
 
-        print("  Agent B, pass 1: deterministic sink tagging + taint composition (no LLM)")
-        tag_stats = taint_mod.run_taint_pass(args.path, repo, store, limit=args.limit)
-        det_findings = taint_mod.find_taint_findings(store, repo, max_hops=args.max_hops)
-        print(f"    functions_processed={tag_stats['functions_processed']}  sink_hits={tag_stats['sink_hits']}  "
-              f"deterministic_findings={len(det_findings)}")
+        agent_findings: list[Finding] = []
+        qualified: list[Finding] = []
+        arch_findings: list[Finding] = []
+        if llm is not None:
+            print("  Agent B, pass 0: sanitizer tagging (LLM, cached by body_hash)")
+            san_stats = taint_mod.tag_sanitizers(store, repo, args.path, llm)
+            print(f"    candidates={san_stats['candidates']}  tagged={san_stats['tagged']}")
+
+        print("  Agent B, pass 1: deterministic taint composition from graph DFG (no LLM)")
+        det_findings = taint_mod.find_taint_findings(store, repo, root=args.path,
+                                                      max_hops=args.max_hops)
+        print(f"    deterministic_findings={len(det_findings)}")
         stage1 = [
             Finding(category="security", subcategory=fnd["subcategory"], source="graph_proven",
                    owning_fqn=fnd["owning_fqn"], file=fnd["file"], line=fnd["line"],
@@ -118,31 +126,31 @@ def _cmd_analyze(args) -> int:
             for fnd in det_findings
         ]
 
-        agent_findings: list[Finding] = []
-        qualified: list[Finding] = []
-        arch_findings: list[Finding] = []
         if llm is not None:
             print(f"  Agent A: correctness + impact, chunked over the repo "
                   f"({args.provider}/{args.model or default_model(args.provider)})")
             agent_findings = agents_mod.run_agent_a_scan(store, args.path, repo, llm, file_limit=args.limit)
             print(f"    findings={len(agent_findings)}")
 
-            print("  Agent B, pass 2: taint qualify (reads raw chain source, not flow prose)")
-            qualified = taint_mod.run_taint_qualify(store, repo, args.path, llm,
-                                                    max_hops=args.max_hops, limit=args.qualify_limit)
-            print(f"    confirmed true_positive={len(qualified)}")
+            print("  Agent B, pass 2: security discovery (reads reachable chains + taint evidence, free-form)")
+            qualified = taint_mod.run_agent_b_security(store, repo, args.path, llm,
+                                                       max_hops=args.max_hops, limit=args.qualify_limit)
+            print(f"    security findings={len(qualified)}")
 
-            print("  Agent B, pass 3: architecture/layering (shape catalogue -> flag -> deep-dive raw code)")
+            print("  Agent C: architecture/layering (shape catalogue -> flag -> deep-dive raw code, free-form)")
             arch = taint_mod.run_architecture_pass(store, repo, args.path, llm, shape_limit=args.shape_limit)
             arch_findings = arch["findings"]
             print(f"    shapes_total={arch['shapes_total']}  shapes_flagged={arch['shapes_flagged']}  "
                   f"findings={len(arch_findings)}")
         else:
-            print("  Agent A + Agent B qualify/architecture — skipped (--no-llm)")
+            print("  Agent A + Agent B qualify/architecture/sanitizers — skipped (--no-llm)")
 
-        all_findings = collapse_cross_category_duplicates(dedupe(stage1 + agent_findings + arch_findings))
-        print(f"  scoring: blast radius + qualify + severity "
-              f"({'no LLM qualify — raw blast counts' if llm is None else 'LLM qualify'})")
+        # Agent B security findings are now DISCOVERY (free-form), so they join
+        # the scored set and get deduped — graph_proven beats an llm_judged
+        # re-report of the same family per dedupe_findings.
+        all_findings = dedupe_findings(stage1 + agent_findings + arch_findings + qualified)
+        print(f"  scoring: blast radius + severity "
+              f"({'no LLM — raw blast counts' if llm is None else 'LLM-scored'})")
         scored = scoring_mod.score_findings(store, repo, all_findings, llm=llm)
 
         print(f"\n  total scored findings: {len(scored)}\n")
@@ -151,16 +159,10 @@ def _cmd_analyze(args) -> int:
                   f"{f.owning_fqn} ({f.file}:{f.line}) blast={f.blast_count}/{f.qualified_blast_count}")
             print(f"      {f.message}")
 
-        if qualified:
-            print(f"\n  Agent B qualify — LLM-confirmed true positives (separate list): {len(qualified)}\n")
-            for f in qualified:
-                print(f"    [{f.subcategory}] {f.owning_fqn} ({f.file}:{f.line}) — {f.message}")
-
         if args.json:
             with open(args.json, "w", encoding="utf-8") as fh:
                 json.dump({
                     "scored": [f.to_dict() for f in scored],
-                    "agent_b_qualified": [f.to_dict() for f in qualified],
                 }, fh, indent=2, sort_keys=True)
             print(f"\n  wrote findings JSON: {args.json}")
     finally:
